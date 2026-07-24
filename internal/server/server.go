@@ -3,7 +3,7 @@ package server
 import (
 	"log"
 	"net"
-
+	"github.com/shivampathak/carrot/internal/client"
 	"github.com/shivampathak/carrot/internal/config"
 )
 
@@ -43,33 +43,33 @@ func (s *Server) Start() error {
 
 		log.Printf("Client Connected: %s\n", conn.RemoteAddr())
 
-		go s.handleConnection(conn)
+		client := client.NewClient(conn)
+		go s.handleClient(client)
 
 	}
 }
 
 
-func (s *Server) handleConnection(conn net.Conn) {
+func (s *Server) handleClient(c *client.Client) {
 
-	defer conn.Close()
+	defer c.Close()
 
 	buffer := make([]byte, 1024)
 
 	for {
-
-		n, err := conn.Read(buffer)
-
+		n, err := c.Read(buffer)
 		if err != nil {
-			log.Printf("Client disconnected: %s\n", conn.RemoteAddr())
+			log.Printf("Client disconnected: %s", c.RemoteAddr())
 			return
 		}
 
-		message := string(buffer[:n])
+		message := buffer[:n]
 
-		log.Printf("Received: %s", message)
+		log.Printf("Received: %s", string(message))
 
-		conn.Write([]byte(message))
-
+		if _, err := c.Write(message); err != nil {
+			log.Printf("Write failed: %v", err)
+			return
+		}
 	}
-
 }
