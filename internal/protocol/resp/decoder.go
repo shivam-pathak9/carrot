@@ -39,4 +39,5 @@ func (d *Decoder) Decode() (Value, error) {
 
 	default:
 		return Value{}, fmt.Errorf("unsupported RESP type %q", prefix)
+	}
 }

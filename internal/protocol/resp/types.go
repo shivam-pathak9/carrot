@@ -1,4 +1,5 @@
 package resp
+
 import "fmt"
 
 // Type represents the RESP data type.
@@ -16,7 +17,7 @@ const (
 	Error        Type = '-'
 	Integer      Type = ':'
 	BulkString   Type = '$'
-	Array         Type = '*'
+	Array        Type = '*'
 )
 
 // Value represents a single RESP value.
@@ -40,8 +41,6 @@ type Value struct {
 	// Used for Array
 	Array []Value
 }
-
-
 
 // String returns the string representation of the Type.
 func (t Type) String() string {

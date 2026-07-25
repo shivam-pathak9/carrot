@@ -1,21 +1,27 @@
 package server
 
 import (
+	"github.com/shivampathak/carrot/internal/client"
+	"github.com/shivampathak/carrot/internal/command"
+	"github.com/shivampathak/carrot/internal/config"
+	"github.com/shivampathak/carrot/internal/protocol/resp"
 	"log"
 	"net"
-	"github.com/shivampathak/carrot/internal/client"
-	"github.com/shivampathak/carrot/internal/config"
 )
 
 type Server struct {
 	config   config.Config
 	listener net.Listener
-}
 
+	parser   *command.Parser
+	executor *command.Executor
+}
 
 func NewServer(cfg config.Config) *Server {
 	return &Server{
-		config: cfg,
+		config:   cfg,
+		parser:   command.NewParser(),
+		executor: command.NewExecutor(),
 	}
 }
 
@@ -49,26 +55,40 @@ func (s *Server) Start() error {
 	}
 }
 
-
-func (s *Server) handleClient(c *client.Client) {
-
-	defer c.Close()
-
-	buffer := make([]byte, 1024)
+func (s *Server) handleClient(client *client.Client) {
 
 	for {
-		n, err := c.Read(buffer)
+		// 1. Decode RESP request
+		value, err := client.Decoder().Decode()
 		if err != nil {
-			log.Printf("Client disconnected: %s", c.RemoteAddr())
 			return
 		}
 
-		message := buffer[:n]
+		// 2. Parse RESP into a Command
+		cmd, err := s.parser.Parse(value)
+		if err != nil {
+			_ = client.Encoder().Encode(resp.NewError(err.Error()))
+			_ = client.Flush()
+			continue
+		}
 
-		log.Printf("Received: %s", string(message))
+		log.Printf("Command=%s Args=%v", cmd.Name, cmd.Args)
 
-		if _, err := c.Write(message); err != nil {
-			log.Printf("Write failed: %v", err)
+		// 3. Execute command
+		response, err := s.executor.Execute(cmd)
+		if err != nil {
+			_ = client.Encoder().Encode(resp.NewError(err.Error()))
+			_ = client.Flush()
+			continue
+		}
+
+		// 4. Encode RESP response
+		if err := client.Encoder().Encode(response); err != nil {
+			return
+		}
+
+		// 5. Send it to the client
+		if err := client.Flush(); err != nil {
 			return
 		}
 	}
