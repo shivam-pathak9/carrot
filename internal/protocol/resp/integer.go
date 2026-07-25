@@ -6,6 +6,8 @@ import (
 )
 
 func (d *Decoder) decodeInteger() (Value, error) {
+	// decodeInteger parses a RESP integer line (`:<number>`) and
+	// returns a Value wrapping the parsed int64.
 	line, err := d.readLine()
 	if err != nil {
 		return Value{}, err

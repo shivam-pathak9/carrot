@@ -18,6 +18,8 @@ type Server struct {
 }
 
 func NewServer(cfg config.Config) *Server {
+	// NewServer constructs a server instance with the provided
+	// configuration and initial command parser/executor.
 	return &Server{
 		config:   cfg,
 		parser:   command.NewParser(),
@@ -38,6 +40,8 @@ func (s *Server) Start() error {
 
 	log.Printf("Carrot listening on %s\n", address)
 
+	// Accept loop: accept connections and start a goroutine to
+	// handle each client independently.
 	for {
 
 		conn, err := s.listener.Accept()
@@ -56,7 +60,19 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) handleClient(client *client.Client) {
-
+	// handleClient runs in a goroutine per connected client.
+	// It follows a clear request-response pipeline:
+	// 1. `Decode()` reads a RESP value from the client (may be an
+	//    array representing a command).
+	// 2. `Parse()` converts the RESP value to a `Command`.
+	// 3. `Execute()` produces a response `Value`.
+	// 4. `Encoder.Encode()` writes the response into the client's
+	//    buffered writer.
+	// 5. `Flush()` sends buffered data to the network.
+	//
+	// This separation allows batching multiple writes into a
+	// single `Flush()` for throughput, while still providing
+	// explicit flush points for protocol correctness.
 	for {
 		// 1. Decode RESP request
 		value, err := client.Decoder().Decode()
@@ -88,6 +104,10 @@ func (s *Server) handleClient(client *client.Client) {
 		}
 
 		// 5. Send it to the client
+		// We call `Flush()` to ensure the buffered encoder output is
+		// transmitted to the remote peer. If Flush fails it usually
+		// indicates the connection has been closed or encounter IO
+		// errors and we should terminate the handler.
 		if err := client.Flush(); err != nil {
 			return
 		}

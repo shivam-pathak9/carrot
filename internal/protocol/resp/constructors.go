@@ -1,6 +1,7 @@
 package resp
 
-// These all are the constructors for the RESP values. They are used to create new RESP values of different types.
+// These all are the constructors for the RESP values.
+// They are used to create new RESP values of different types.
 
 func NewSimpleString(value string) Value {
 	return Value{

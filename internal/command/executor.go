@@ -9,10 +9,19 @@ import (
 type Executor struct{}
 
 func NewExecutor() *Executor {
+	// NewExecutor constructs a command executor. The executor is
+	// responsible for implementing the server-side behavior of
+	// supported commands (PING, SET, GET, etc.). Currently it is
+	// stateless and only implements a small subset.
 	return &Executor{}
 }
 
 func (e *Executor) Execute(cmd Command) (resp.Value, error) {
+
+	// Execute runs the given `Command` and returns a RESP `Value`
+	// that represents the response to send to the client. For
+	// unknown or invalid usage the function returns an appropriate
+	// RESP Error value.
 
 	switch cmd.Name {
 

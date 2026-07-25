@@ -8,6 +8,8 @@ import (
 )
 
 func main() {
+	// Entry point for the Carrot server binary.
+	// Loads default configuration, constructs a server and starts it.
 	// configuration loading
 	cfg := config.DefaultConfig()
 	// creating new server
