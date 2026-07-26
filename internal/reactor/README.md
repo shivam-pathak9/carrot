@@ -63,23 +63,23 @@ sequenceDiagram
     autonumber
     participant Client as Remote Client
     participant Poller as Poller (epoll)
-    participant Loop as EventLoop
+    participant EvLoop as EventLoop
     participant Conn as Connection
     participant Exec as Executor
 
-    Note over Server, Poller: Server Start & Initialization
-    Loop->>Poller: Register(Listener FD, EPOLLIN)
+    Note over Poller, EvLoop: Server Start & Initialization
+    EvLoop->>Poller: Register(Listener FD, EPOLLIN)
     
-    Note over Client, Loop: 1. Connection Acceptance
+    Note over Client, EvLoop: 1. Connection Acceptance
     Client->>Poller: TCP Handshake (SYN -> ACK)
-    Poller-->>Loop: Ready Event: Listener FD (EPOLLIN)
-    Loop->>Loop: handleAccept() -> unix.Accept4()
-    Loop->>Poller: Register(Client FD, EPOLLIN|EPOLLERR|EPOLLRDHUP)
+    Poller-->>EvLoop: Ready Event: Listener FD (EPOLLIN)
+    EvLoop->>EvLoop: handleAccept() -> unix.Accept4()
+    EvLoop->>Poller: Register(Client FD, EPOLLIN|EPOLLERR|EPOLLRDHUP)
 
     Note over Client, Exec: 2. Request Processing
     Client->>Poller: Send Data "*1\r\n$4\r\nPING\r\n"
-    Poller-->>Loop: Ready Event: Client FD (EPOLLIN)
-    Loop->>Conn: OnRead()
+    Poller-->>EvLoop: Ready Event: Client FD (EPOLLIN)
+    EvLoop->>Conn: OnRead()
     Conn->>Conn: unix.Read() into inBuf
     Conn->>Conn: RESP Decoder -> Command Parser ("PING")
     Conn->>Exec: Execute("PING") -> returns "PONG"
@@ -92,8 +92,8 @@ sequenceDiagram
     else Partial Write (EAGAIN/EWOULDBLOCK)
         Conn->>Poller: Modify(Client FD, EPOLLIN|EPOLLOUT)
         Note over Poller, Conn: Wait for socket writable readiness
-        Poller-->>Loop: Ready Event: Client FD (EPOLLOUT)
-        Loop->>Conn: OnWrite() -> Flush() remaining bytes
+        Poller-->>EvLoop: Ready Event: Client FD (EPOLLOUT)
+        EvLoop->>Conn: OnWrite() -> Flush() remaining bytes
         Conn->>Poller: Reset Interest (remove EPOLLOUT)
     end
 ```
