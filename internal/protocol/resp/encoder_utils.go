@@ -41,9 +41,13 @@ func (e *Encoder) encodeInteger(v Value) error {
 }
 
 func (e *Encoder) encodeBulkString(v Value) error {
-
 	// encodeBulkString writes a RESP Bulk String header and payload
-	// `$<length>\r\n<payload>\r\n`.
+	// `$<length>\r\n<payload>\r\n` or `$-1\r\n` for NULL bulk strings.
+	if v.IsNull {
+		_, err := fmt.Fprintf(e.writer, "$-1\r\n")
+		return err
+	}
+
 	_, err := fmt.Fprintf(
 		e.writer,
 		"$%d\r\n%s\r\n",

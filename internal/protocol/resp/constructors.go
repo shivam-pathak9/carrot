@@ -31,6 +31,13 @@ func NewBulkString(value string) Value {
 	}
 }
 
+func NewNullBulkString() Value {
+	return Value{
+		Type:   BulkString,
+		IsNull: true,
+	}
+}
+
 func NewArray(values ...Value) Value {
 	return Value{
 		Type:  Array,

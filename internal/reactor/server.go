@@ -10,6 +10,7 @@ import (
 
 	"github.com/shivampathak/carrot/internal/command"
 	"github.com/shivampathak/carrot/internal/config"
+	"github.com/shivampathak/carrot/internal/storage"
 	"golang.org/x/sys/unix"
 )
 
@@ -21,7 +22,7 @@ import (
 //   - poller    : Pointer to Poller wrapping Linux epoll instance.
 //   - eventLoop : Pointer to EventLoop engine managing socket readiness events and event dispatching.
 //   - parser    : Pointer to command.Parser converting RESP values into structured Commands.
-//   - executor  : Pointer to command.Executor implementing server behavior for commands (PING, etc.).
+//   - executor  : Pointer to command.Executor implementing server behavior for commands (PING, GET, SET, TTL, etc.).
 type Server struct {
 	config     config.Config
 	listenerFD int // OS File Descriptor for server listening socket (e.g. fd=3)
@@ -33,12 +34,13 @@ type Server struct {
 	executor *command.Executor // Shared command executor
 }
 
-// NewServer constructs a new Reactor Server instance with default parser and executor.
+// NewServer constructs a new Reactor Server instance with default parser, storage engine, and executor.
 func NewServer(cfg config.Config) *Server {
+	store := storage.NewStore()
 	return &Server{
 		config:   cfg,
 		parser:   command.NewParser(),
-		executor: command.NewExecutor(),
+		executor: command.NewExecutor(store),
 	}
 }
 

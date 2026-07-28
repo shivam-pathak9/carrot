@@ -49,7 +49,8 @@ func (d *Decoder) decodeBulkString() (Value, error) {
 	// RESP Null Bulk String
 	if length == -1 {
 		return Value{
-			Type: BulkString,
+			Type:   BulkString,
+			IsNull: true,
 		}, nil
 	}
 

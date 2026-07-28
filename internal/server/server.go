@@ -5,6 +5,7 @@ import (
 	"github.com/shivampathak/carrot/internal/command"
 	"github.com/shivampathak/carrot/internal/config"
 	"github.com/shivampathak/carrot/internal/protocol/resp"
+	"github.com/shivampathak/carrot/internal/storage"
 	"log"
 	"net"
 )
@@ -19,11 +20,12 @@ type Server struct {
 
 func NewServer(cfg config.Config) *Server {
 	// NewServer constructs a server instance with the provided
-	// configuration and initial command parser/executor.
+	// configuration, a fresh storage engine, and initial command parser/executor.
+	store := storage.NewStore()
 	return &Server{
 		config:   cfg,
 		parser:   command.NewParser(),
-		executor: command.NewExecutor(),
+		executor: command.NewExecutor(store),
 	}
 }
 

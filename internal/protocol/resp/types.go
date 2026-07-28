@@ -32,6 +32,9 @@ const (
 type Value struct {
 	Type Type
 
+	// IsNull indicates a RESP Null value (e.g. Null Bulk String `$-1\r\n`)
+	IsNull bool
+
 	// Used for Simple String, Bulk String and Error
 	String string
 
