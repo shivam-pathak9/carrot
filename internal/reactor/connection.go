@@ -142,9 +142,19 @@ func (c *Connection) processCommands() error {
 			return c.Flush()
 		}
 
-		// Calculate exact byte count consumed by decoder for this RESP value:
-		// len(raw) is initial snapshot length, reader.Len() is remaining unread bytes in reader.
-		consumed := len(raw) - reader.Len()
+		// Calculate exact byte count consumed by decoder for this RESP value.
+		//
+		// WHY we subtract both reader.Len() AND bufReader.Buffered():
+		//   bufio.NewReader pre-fetches bytes from the underlying `reader` into an internal
+		//   4096-byte buffer eagerly. After Decode() finishes, `reader.Len()` reflects bytes
+		//   NOT yet pulled into bufio's buffer, and `bufReader.Buffered()` reflects bytes
+		//   pulled into bufio's buffer but NOT yet consumed by the decoder.
+		//   Omitting bufReader.Buffered() causes consumed == len(raw) on every call,
+		//   silently discarding all remaining pipelined commands in inBuf.
+		//
+		//   Correct formula:
+		//     consumed = total_snapshot - bytes_never_read_into_bufio - bytes_in_bufio_but_not_decoded
+		consumed := len(raw) - reader.Len() - bufReader.Buffered()
 		c.inBuf.Next(consumed) // Advance inBuf by consumed byte count
 
 		// Step 1: Parse decoded RESP Value into structured Command (Name & Args)

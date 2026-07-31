@@ -1,13 +1,14 @@
 package server
 
 import (
+	"log"
+	"net"
+
 	"github.com/shivampathak/carrot/internal/client"
 	"github.com/shivampathak/carrot/internal/command"
 	"github.com/shivampathak/carrot/internal/config"
 	"github.com/shivampathak/carrot/internal/protocol/resp"
 	"github.com/shivampathak/carrot/internal/storage"
-	"log"
-	"net"
 )
 
 type Server struct {
@@ -89,8 +90,6 @@ func (s *Server) handleClient(client *client.Client) {
 			_ = client.Flush()
 			continue
 		}
-
-		log.Printf("Command=%s Args=%v", cmd.Name, cmd.Args)
 
 		// 3. Execute command
 		response, err := s.executor.Execute(cmd)

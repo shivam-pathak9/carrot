@@ -3,6 +3,7 @@ package resp
 import (
 	"bufio"
 	"fmt"
+	"strings"
 )
 
 type Decoder struct {
@@ -34,6 +35,10 @@ func (d *Decoder) Decode() (Value, error) {
 	// - Any IO or protocol error is returned immediately so the
 	//   caller (server) can decide how to handle client disconnects
 	//   or protocol violations.
+	// - Inline commands (plain text, no RESP framing) are supported
+	//   for tools like redis-benchmark that send "PING\r\n" before
+	//   switching to full RESP. We detect them when the first byte
+	//   is not a known RESP prefix and fall back to decodeInline().
 	prefix, err := d.reader.ReadByte()
 	if err != nil {
 		return Value{}, err
@@ -56,6 +61,37 @@ func (d *Decoder) Decode() (Value, error) {
 		return d.decodeArray()
 
 	default:
-		return Value{}, fmt.Errorf("unsupported RESP type %q", prefix)
+		// Not a RESP framed message — treat as an inline command.
+		// redis-benchmark (and redis-cli) send plain-text commands
+		// like "PING\r\n" during handshake / pipeline warm-up.
+		// We unread the byte so decodeInline can read the full line.
+		if err := d.reader.UnreadByte(); err != nil {
+			return Value{}, fmt.Errorf("failed to unread byte: %w", err)
+		}
+		return d.decodeInline()
 	}
+}
+
+// decodeInline parses an inline command (plain text, CRLF-terminated).
+// Redis protocol allows clients to send commands as plain text lines,
+// e.g. "PING\r\n" or "SET key value\r\n". We convert the whitespace-
+// separated tokens into a RESP Array of BulkStrings so the rest of
+// the pipeline (Parser → Executor) needs no changes.
+func (d *Decoder) decodeInline() (Value, error) {
+	line, err := d.readLine()
+	if err != nil {
+		return Value{}, fmt.Errorf("inline command read error: %w", err)
+	}
+
+	tokens := strings.Fields(line)
+	if len(tokens) == 0 {
+		return Value{}, fmt.Errorf("empty inline command")
+	}
+
+	values := make([]Value, len(tokens))
+	for i, tok := range tokens {
+		values[i] = NewBulkString(tok)
+	}
+
+	return NewArray(values...), nil
 }
