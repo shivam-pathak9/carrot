@@ -107,13 +107,53 @@ func (s *Store) TTL(key string) int64 {
 
 // Del removes a key from the storage engine.
 // Returns true if key existed and was deleted, false otherwise.
+// If the key was passively expired, it is removed and false is returned.
 func (s *Store) Del(key string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, exists := s.data[key]; exists {
+	obj, exists := s.data[key]
+	if !exists {
+		return false
+	}
+
+	// Check passive expiration
+	if !obj.ExpiresAt.IsZero() && time.Now().After(obj.ExpiresAt) {
+		delete(s.data, key) // Passive deletion
+		return false
+	}
+
+	delete(s.data, key)
+	return true
+}
+
+// Expire sets a TTL (time-to-live) in seconds on an existing key.
+//
+// Returns:
+//   - true  if the timeout was set or key was deleted due to non-positive seconds.
+//   - false if the key does not exist or has already expired.
+func (s *Store) Expire(key string, seconds int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	obj, exists := s.data[key]
+	if !exists {
+		return false
+	}
+
+	// Check if the key is already passively expired
+	if !obj.ExpiresAt.IsZero() && time.Now().After(obj.ExpiresAt) {
+		delete(s.data, key)
+		return false
+	}
+
+	if seconds <= 0 {
 		delete(s.data, key)
 		return true
 	}
-	return false
+
+	obj.ExpiresAt = time.Now().Add(time.Duration(seconds) * time.Second)
+	s.data[key] = obj
+	return true
 }
+

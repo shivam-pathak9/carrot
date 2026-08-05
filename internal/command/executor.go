@@ -44,6 +44,12 @@ func (e *Executor) Execute(cmd Command) (resp.Value, error) {
 	case "TTL":
 		return handleTTL(e.store, cmd.Args)
 
+	case "DEL":
+		return handleDel(e.store, cmd.Args)
+
+	case "EXPIRE":
+		return handleExpire(e.store, cmd.Args)
+
 	default:
 		return resp.NewError(
 			fmt.Sprintf("ERR unknown command '%s'", strings.ToLower(cmd.Name)),
