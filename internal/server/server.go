@@ -3,6 +3,7 @@ package server
 import (
 	"log"
 	"net"
+	"time"
 
 	"github.com/shivampathak/carrot/internal/client"
 	"github.com/shivampathak/carrot/internal/command"
@@ -15,8 +16,11 @@ type Server struct {
 	config   config.Config
 	listener net.Listener
 
+	store    *storage.Store
 	parser   *command.Parser
 	executor *command.Executor
+
+	stopChan chan struct{}
 }
 
 func NewServer(cfg config.Config) *Server {
@@ -25,8 +29,10 @@ func NewServer(cfg config.Config) *Server {
 	store := storage.NewStore()
 	return &Server{
 		config:   cfg,
+		store:    store,
 		parser:   command.NewParser(),
 		executor: command.NewExecutor(store),
+		stopChan: make(chan struct{}),
 	}
 }
 
@@ -42,6 +48,10 @@ func (s *Server) Start() error {
 	s.listener = listener
 
 	log.Printf("Carrot listening on %s\n", address)
+
+	// Launch background Active Expiration loop for multi-threaded server.
+	// Runs every 100ms in a dedicated background goroutine.
+	go s.startActiveExpireLoop()
 
 	// Accept loop: accept connections and start a goroutine to
 	// handle each client independently.
@@ -59,6 +69,30 @@ func (s *Server) Start() error {
 		client := client.NewClient(conn)
 		go s.handleClient(client)
 
+	}
+}
+
+// startActiveExpireLoop runs in a dedicated background goroutine for the multi-threaded server.
+//
+// WHY A DEDICATED GOROUTINE?
+// In the multi-threaded per-client server model (cmd/server), each client connection runs in its own goroutine.
+// To ensure unqueried expired keys do not linger in memory forever, this dedicated background goroutine
+// wakes up every 100ms via time.Ticker and invokes store.ActiveExpireCycle().
+//
+// THREAD SAFETY:
+// Thread safety is guaranteed by storage.Store's internal RWMutex (s.mu.Lock()), allowing the background
+// active expiration loop to safely purge expired keys without racing against client handler goroutines.
+func (s *Server) startActiveExpireLoop() {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.store.ActiveExpireCycle()
+		case <-s.stopChan:
+			return
+		}
 	}
 }
 

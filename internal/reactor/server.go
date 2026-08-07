@@ -30,6 +30,7 @@ type Server struct {
 	poller    *Poller    // Linux epoll wrapper instance
 	eventLoop *EventLoop // Main event multiplexing loop engine
 
+	store    *storage.Store    // Shared storage engine handle
 	parser   *command.Parser   // Shared command parser
 	executor *command.Executor // Shared command executor
 }
@@ -39,6 +40,7 @@ func NewServer(cfg config.Config) *Server {
 	store := storage.NewStore()
 	return &Server{
 		config:   cfg,
+		store:    store,
 		parser:   command.NewParser(),
 		executor: command.NewExecutor(store),
 	}
@@ -53,7 +55,7 @@ func NewServer(cfg config.Config) *Server {
 //   4. unix.Listen      : Marks socket FD as passive listener with connection backlog queue of 128.
 //   5. NewPoller        : Creates epoll instance via unix.EpollCreate1.
 //   6. poller.Register  : Registers listener socket FD in epoll interest list for EPOLLIN (incoming connections).
-//   7. eventLoop.Run    : Starts infinite epoll_wait event loop.
+//   7. eventLoop.Run    : Starts infinite epoll_wait event loop with Active Expiration cycle.
 func (s *Server) Start() error {
 	// Parse port string configuration to integer
 	portInt, err := strconv.Atoi(s.config.Port)
@@ -123,8 +125,8 @@ func (s *Server) Start() error {
 	address := fmt.Sprintf("%s:%s", s.config.Host, s.config.Port)
 	log.Printf("Carrot Reactor listening on %s (epoll fd=%d, listener fd=%d)", address, s.poller.epfd, s.listenerFD)
 
-	// Step 7: Instantiate EventLoop and run main epoll_wait event multiplexing loop
-	s.eventLoop = NewEventLoop(s.poller, s.listenerFD, s.parser, s.executor)
+	// Step 7: Instantiate EventLoop with store reference and run main epoll_wait event multiplexing loop
+	s.eventLoop = NewEventLoop(s.poller, s.listenerFD, s.parser, s.executor, s.store)
 	return s.eventLoop.Run()
 }
 

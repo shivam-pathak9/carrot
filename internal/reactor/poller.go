@@ -143,25 +143,26 @@ func (p *Poller) Unregister(fd int) error {
 	return nil
 }
 
-// Wait blocks execution until one or more file descriptors registered in epoll become ready for I/O.
+// Wait blocks execution until one or more file descriptors registered in epoll become ready for I/O, or until timeoutMS elapses.
 //
-// System Call: unix.EpollWait(epfd, events_slice, timeout=-1)
+// System Call: unix.EpollWait(epfd, events_slice, timeoutMS)
 //
 // Parameters:
-//   - timeout = -1 : Wait indefinitely until at least one event triggers.
+//   - timeoutMS : Timeout in milliseconds. -1 means block indefinitely until an event triggers.
+//                 Positive values (e.g. 100) mean wait up to 100ms before returning empty event slice.
 //
 // Signal Handling:
 //   - If interrupted by an OS signal (EINTR), it automatically retries instead of crashing.
-func (p *Poller) Wait() ([]Event, error) {
+func (p *Poller) Wait(timeoutMS int) ([]Event, error) {
 	// Pre-allocate slice of EpollEvent structures to receive ready events from kernel
 	events := make([]unix.EpollEvent, p.maxEvents)
 
 	for {
 		// epoll_wait populates 'events' slice and returns 'n' (number of ready FDs)
 		n, err := unix.EpollWait(
-			p.epfd,   // Epoll handle
-			events,   // Buffer slice to populate with ready events
-			-1,       // Timeout in ms (-1 means block infinitely until event occurs)
+			p.epfd,      // Epoll handle
+			events,      // Buffer slice to populate with ready events
+			timeoutMS,   // Timeout in ms (-1 = block infinitely, >0 = timeout in ms)
 		)
 
 		if err != nil {

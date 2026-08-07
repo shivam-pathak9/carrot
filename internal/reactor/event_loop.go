@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/shivampathak/carrot/internal/command"
+	"github.com/shivampathak/carrot/internal/storage"
 	"golang.org/x/sys/unix"
 )
 
@@ -32,6 +33,7 @@ type EventLoop struct {
 	listenerFD int               // Server listening socket File Descriptor (e.g. 3)
 	parser     *command.Parser   // Shared command parser handle
 	executor   *command.Executor // Shared command executor handle
+	store      *storage.Store    // Shared storage engine handle for active expiration
 
 	conns map[int]*Connection // O(1) lookup table mapping socket FD -> Connection struct
 
@@ -41,12 +43,13 @@ type EventLoop struct {
 }
 
 // NewEventLoop constructs a new EventLoop instance.
-func NewEventLoop(poller *Poller, listenerFD int, parser *command.Parser, executor *command.Executor) *EventLoop {
+func NewEventLoop(poller *Poller, listenerFD int, parser *command.Parser, executor *command.Executor, store *storage.Store) *EventLoop {
 	return &EventLoop{
 		poller:     poller,
 		listenerFD: listenerFD,
 		parser:     parser,
 		executor:   executor,
+		store:      store,
 		conns:      make(map[int]*Connection),
 		stopChan:   make(chan struct{}),
 	}
@@ -55,11 +58,32 @@ func NewEventLoop(poller *Poller, listenerFD int, parser *command.Parser, execut
 // Run enters the main reactor event loop.
 //
 // Execution Flow:
-//   1. Calls `poller.Wait()` which blocks in `epoll_wait` until kernel reports ready socket file descriptors.
-//   2. Iterates over ready event slice (`events`).
-//   3. Event Routing:
-//      - If `ev.FD == listenerFD`: Calls `handleAccept()` to non-blockingly accept new incoming TCP clients.
-//      - Else (`ev.FD` is a client socket): Calls `handleClientEvent(fd, events)` to handle read/write/close events.
+//   1. Calls `poller.Wait(100)` which blocks in `epoll_wait` up to 100ms waiting for ready socket file descriptors.
+//   2. Iterates over ready event slice (`events`) and dispatches ready I/O events (accept/read/write).
+//   3. Active Expiration Execution:
+//      Invokes `store.ActiveExpireCycle()` after processing ready I/O events in each iteration.
+//
+//             ACTIVE EXPIRE TIMING & SINGLE-THREADED DESIGN
+//
+// 1. WHEN DOES ACTIVE CLEANING START?
+//    Active cleaning is triggered in step 3 of the main reactor loop iteration:
+//    - Right after `poller.Wait(100)` returns ready socket events and all ready network I/O
+//      (client commands, accepts, writes) for that batch have been fully processed.
+//    - If there are NO active client requests (idle server), `poller.Wait(100)` times out after 100ms,
+//      returning 0 ready events. The loop immediately proceeds to step 3 to execute `ActiveExpireCycle()`.
+//      Thus, active expiration runs consistently at 10Hz (every 100ms) even under zero traffic!
+//
+// 2. WHY RUN DIRECTLY ON THE EVENT LOOP THREAD?
+//    - ZERO RACE CONDITIONS: Because the reactor operates on a single event-loop thread, executing
+//      `ActiveExpireCycle()` directly on this thread eliminates data races between client command
+//      reads/writes and background key purges.
+//    - LOCK-FREE EFFICIENCY: Eliminates mutex locking overhead and context-switching cost.
+//
+// 3. LATENCY & UNBLOCKING GUARANTEES:
+//    Because `ActiveExpireCycle()` enforces a strict 25ms hard time cap, the main event thread is
+//    guaranteed to resume calling `epoll_wait` within 25ms, keeping network latency ultra-low and
+//    preventing socket buffer overflows.
+
 func (el *EventLoop) Run() error {
 	el.mu.Lock()
 	el.running = true
@@ -83,8 +107,10 @@ func (el *EventLoop) Run() error {
 		default:
 		}
 
-		// Block until epoll_wait system call returns ready socket events
-		events, err := el.poller.Wait()
+		// Wait up to 100ms for epoll events.
+		// Passing 100ms ensures that even if no client traffic arrives, epoll_wait unblocks every 100ms
+		// so active expiration can execute regularly.
+		events, err := el.poller.Wait(100)
 		if err != nil {
 			if errors.Is(err, unix.EINTR) {
 				continue // Signal interrupt (e.g. SIGINT); retry loop
@@ -100,6 +126,11 @@ func (el *EventLoop) Run() error {
 			} else {
 				el.handleClientEvent(ev.FD, ev.Events) // Existing client socket event (read/write/close)
 			}
+		}
+
+		// Active Expiration: Purge expired keys proactively in the event loop thread
+		if el.store != nil {
+			el.store.ActiveExpireCycle()
 		}
 	}
 }
