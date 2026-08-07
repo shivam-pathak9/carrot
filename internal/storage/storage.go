@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"log"
 	"sync"
 	"time"
 )
@@ -272,6 +273,10 @@ func (s *Store) ActiveExpireCycle() int {
 		if ratio <= thresholdRatio {
 			break
 		}
+	}
+	
+	if totalDeleted > 0 {
+		log.Printf("[Active Expire] Cleaned %d expired key(s) from memory", totalDeleted)
 	}
 
 	return totalDeleted
