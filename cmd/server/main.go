@@ -3,8 +3,8 @@ package main
 import (
 	"log"
 
-	"github.com/shivampathak/carrot/internal/config"
-	"github.com/shivampathak/carrot/internal/server"
+	"github.com/shivam-pathak9/carrot/internal/config"
+	"github.com/shivam-pathak9/carrot/internal/server"
 )
 
 func main() {

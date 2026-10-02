@@ -9,8 +9,8 @@ import (
 	"log"
 	"sync"
 
-	"github.com/shivampathak/carrot/internal/command"
-	"github.com/shivampathak/carrot/internal/storage"
+	"github.com/shivam-pathak9/carrot/internal/command"
+	"github.com/shivam-pathak9/carrot/internal/storage"
 	"golang.org/x/sys/unix"
 )
 
@@ -20,11 +20,11 @@ import (
 // Struct Fields & Why they exist in EventLoop:
 //   - poller    : Pointer to Poller (epoll wrapper). Monitors all active socket file descriptors for I/O events.
 //   - listenerFD: Numeric file descriptor for server TCP listener socket (e.g. fd=3).
-//                 When epoll signals EPOLLIN on listenerFD, it indicates a new client connection wants to connect.
+//     When epoll signals EPOLLIN on listenerFD, it indicates a new client connection wants to connect.
 //   - parser    : Pointer to command.Parser. Used when instantiating new Connection objects.
 //   - executor  : Pointer to command.Executor. Used when instantiating new Connection objects.
 //   - conns     : Registry map (`map[fd]*Connection`) mapping numeric socket file descriptors (e.g. 5, 6)
-//                 to their corresponding Connection instance. Enables O(1) lookup when epoll triggers an event on an FD.
+//     to their corresponding Connection instance. Enables O(1) lookup when epoll triggers an event on an FD.
 //   - stopChan  : Channel used to notify event loop goroutine to perform graceful shutdown.
 //   - mu        : Mutex protecting access to `running` state boolean flag during start/stop calls.
 //   - running   : Boolean status flag indicating whether event loop main thread is active.
@@ -71,17 +71,16 @@ func NewEventLoop(poller *Poller, listenerFD int, parser *command.Parser, execut
 //      (client commands, accepts, writes) for that batch have been fully processed.
 //    - If there are NO active client requests (idle server), `poller.Wait(100)` times out after 100ms,
 //      returning 0 ready events. The loop immediately proceeds to step 3 to execute `ActiveExpireCycle()`.
-//      Thus, active expiration runs consistently at 10Hz (every 100ms) even under zero traffic!
+//      Thus, active expiration runs consistently at 10Hz (every 100ms) even under zero traffic.
 //
 // 2. WHY RUN DIRECTLY ON THE EVENT LOOP THREAD?
-//    - ZERO RACE CONDITIONS: Because the reactor operates on a single event-loop thread, executing
-//      `ActiveExpireCycle()` directly on this thread eliminates data races between client command
-//      reads/writes and background key purges.
-//    - LOCK-FREE EFFICIENCY: Eliminates mutex locking overhead and context-switching cost.
+//    - The reactor is single-threaded, so the expiration sweep and client I/O are serialized on one path.
+//    - This avoids cross-thread races while keeping the work bounded by a fixed time budget.
+//    - The store still uses a mutex for correctness when it accesses shared state.
 //
 // 3. LATENCY & UNBLOCKING GUARANTEES:
 //    Because `ActiveExpireCycle()` enforces a strict 25ms hard time cap, the main event thread is
-//    guaranteed to resume calling `epoll_wait` within 25ms, keeping network latency ultra-low and
+//    guaranteed to resume calling `epoll_wait` within 25ms, keeping network latency bounded and
 //    preventing socket buffer overflows.
 
 func (el *EventLoop) Run() error {
@@ -141,7 +140,7 @@ func (el *EventLoop) Run() error {
 //
 // Why `Accept4` instead of standard `Accept`:
 //   - `SOCK_NONBLOCK`: Ensures newly created client socket FD is immediately non-blocking.
-//                      Avoids a second system call to set O_NONBLOCK via fcntl!
+//     Avoids a second system call to set O_NONBLOCK via fcntl!
 //   - `SOCK_CLOEXEC` : Prevents child processes from inheriting client socket FDs on exec.
 //   - Non-blocking loop: Drains all pending client connections in backlog until `EAGAIN`/`EWOULDBLOCK`.
 func (el *EventLoop) handleAccept() {
@@ -192,17 +191,8 @@ func (el *EventLoop) handleClientEvent(fd int, events uint32) {
 		return // Connection was already closed/removed
 	}
 
-	// 1. Check for socket errors or client disconnection signals
-	//    - unix.EPOLLERR : Error condition happened on socket.
-	//    - unix.EPOLLHUP : Hangup happened on socket (client TCP teardown).
-	//    - unix.EPOLLRDHUP: Remote peer shut down write half of TCP connection (client EOF).
-	if events&(unix.EPOLLERR|unix.EPOLLHUP|unix.EPOLLRDHUP) != 0 {
-		el.closeClient(fd)
-		return
-	}
-
-	// 2. Check Read Readiness (unix.EPOLLIN)
-	//    Data is available in OS socket receive buffer. Read and process commands.
+	// Always process readable data before closing on peer shutdown, otherwise a client
+	// that writes a command and then closes its write half can lose the command.
 	if events&unix.EPOLLIN != 0 {
 		if err := conn.OnRead(); err != nil {
 			if !errors.Is(err, io.EOF) {
@@ -210,6 +200,14 @@ func (el *EventLoop) handleClientEvent(fd int, events uint32) {
 			} else {
 				log.Printf("Client fd %d disconnected", fd)
 			}
+			el.closeClient(fd)
+			return
+		}
+	}
+
+	// Only close for shutdown/error events after we have drained any pending EPOLLIN data.
+	if events&(unix.EPOLLERR|unix.EPOLLHUP|unix.EPOLLRDHUP) != 0 {
+		if events&unix.EPOLLIN == 0 {
 			el.closeClient(fd)
 			return
 		}
@@ -229,8 +227,8 @@ func (el *EventLoop) handleClientEvent(fd int, events uint32) {
 // closeClient unregisters client socket file descriptor (fd), closes its socket, and removes it from conns map.
 func (el *EventLoop) closeClient(fd int) {
 	if conn, ok := el.conns[fd]; ok {
-		conn.Close()          // Unregisters from epoll and calls unix.Close(fd)
-		delete(el.conns, fd)  // Removes from map registry
+		conn.Close()         // Unregisters from epoll and calls unix.Close(fd)
+		delete(el.conns, fd) // Removes from map registry
 	}
 }
 

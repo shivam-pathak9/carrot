@@ -1,6 +1,6 @@
 # Carrot Reactor: Master Architecture & Execution Blueprint
 
-Welcome to the internal architectural documentation for **Carrot Reactor**—a high-performance, single-threaded, non-blocking TCP server built on Linux `epoll` system calls (`golang.org/x/sys/unix`).
+Welcome to the internal architectural documentation for **Carrot Reactor**—a single-threaded, non-blocking TCP server built on Linux `epoll` system calls (`golang.org/x/sys/unix`).
 
 This document provides a complete, step-by-step walkthrough of the entire server lifecycle: from socket creation and kernel epoll registration to non-blocking connection accepting, RESP request processing, socket buffer management, framing rewinds, remote peer resolution, and graceful shutdown.
 

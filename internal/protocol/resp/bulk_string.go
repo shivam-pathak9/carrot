@@ -57,6 +57,9 @@ func (d *Decoder) decodeBulkString() (Value, error) {
 	if length < -1 {
 		return Value{}, fmt.Errorf("invalid bulk string length %d", length)
 	}
+	if length > maxBulkStringLength {
+		return Value{}, fmt.Errorf("bulk string length %d exceeds max allowed %d", length, maxBulkStringLength)
+	}
 
 	// Read payload
 	buf := make([]byte, length)

@@ -5,11 +5,11 @@ import (
 	"net"
 	"time"
 
-	"github.com/shivampathak/carrot/internal/client"
-	"github.com/shivampathak/carrot/internal/command"
-	"github.com/shivampathak/carrot/internal/config"
-	"github.com/shivampathak/carrot/internal/protocol/resp"
-	"github.com/shivampathak/carrot/internal/storage"
+	"github.com/shivam-pathak9/carrot/internal/client"
+	"github.com/shivam-pathak9/carrot/internal/command"
+	"github.com/shivam-pathak9/carrot/internal/config"
+	"github.com/shivam-pathak9/carrot/internal/protocol/resp"
+	"github.com/shivam-pathak9/carrot/internal/storage"
 )
 
 type Server struct {
@@ -72,16 +72,10 @@ func (s *Server) Start() error {
 	}
 }
 
-// startActiveExpireLoop runs in a dedicated background goroutine for the multi-threaded server.
+// startActiveExpireLoop runs a periodic cleanup pass for expired keys in the goroutine-based server.
 //
-// WHY A DEDICATED GOROUTINE?
-// In the multi-threaded per-client server model (cmd/server), each client connection runs in its own goroutine.
-// To ensure unqueried expired keys do not linger in memory forever, this dedicated background goroutine
-// wakes up every 100ms via time.Ticker and invokes store.ActiveExpireCycle().
-//
-// THREAD SAFETY:
-// Thread safety is guaranteed by storage.Store's internal RWMutex (s.mu.Lock()), allowing the background
-// active expiration loop to safely purge expired keys without racing against client handler goroutines.
+// This is separate from client request handling so the store can reclaim stale TTL entries even when no
+// client is actively reading or writing them. The loop wakes every 100ms and calls ActiveExpireCycle().
 func (s *Server) startActiveExpireLoop() {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
@@ -97,23 +91,26 @@ func (s *Server) startActiveExpireLoop() {
 }
 
 func (s *Server) handleClient(client *client.Client) {
-	// handleClient runs in a goroutine per connected client.
-	// It follows a clear request-response pipeline:
-	// 1. `Decode()` reads a RESP value from the client (may be an
-	//    array representing a command).
-	// 2. `Parse()` converts the RESP value to a `Command`.
-	// 3. `Execute()` produces a response `Value`.
-	// 4. `Encoder.Encode()` writes the response into the client's
-	//    buffered writer.
-	// 5. `Flush()` sends buffered data to the network.
-	//
-	// This separation allows batching multiple writes into a
-	// single `Flush()` for throughput, while still providing
-	// explicit flush points for protocol correctness.
+	defer func() {
+		if err := client.Close(); err != nil {
+			log.Printf("failed to close client connection: %v", err)
+		}
+	}()
+
+	if err := client.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		return
+	}
+
+	// handleClient processes one client connection by repeatedly decoding a RESP request,
+	// parsing it into a command, executing it, and writing the response back over the same socket.
+	// A client disconnect, protocol error, or timeout ends the loop and closes the connection.
 	for {
 		// 1. Decode RESP request
 		value, err := client.Decoder().Decode()
 		if err != nil {
+			return
+		}
+		if err := client.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
 			return
 		}
 

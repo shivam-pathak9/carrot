@@ -43,7 +43,7 @@ type Event struct {
 //
 // Struct Fields & Why they exist:
 //   - epfd     : The Linux Epoll instance file descriptor returned by EpollCreate1().
-//                All epoll control operations (ADD, MOD, DEL, WAIT) operate on this handle.
+//     All epoll control operations (ADD, MOD, DEL, WAIT) operate on this handle.
 //   - maxEvents: Maximum number of events to allocate memory for and retrieve per epoll_wait call.
 type Poller struct {
 	epfd      int // File descriptor referencing the kernel epoll interest tree
@@ -82,12 +82,12 @@ func (p *Poller) Register(fd int) error {
 // System Call: unix.EpollCtl(epfd, EPOLL_CTL_ADD, target_fd, &epoll_event)
 //
 // How it works:
-//   1. Construct unix.EpollEvent with interest bitmask (e.g. EPOLLIN) and target FD.
-//   2. Call unix.EpollCtl with command unix.EPOLL_CTL_ADD to insert 'fd' into kernel's interest tree.
+//  1. Construct unix.EpollEvent with interest bitmask (e.g. EPOLLIN) and target FD.
+//  2. Call unix.EpollCtl with command unix.EPOLL_CTL_ADD to insert 'fd' into kernel's interest tree.
 func (p *Poller) RegisterWithEvents(fd int, events uint32) error {
 	event := &unix.EpollEvent{
-		Events: events,     // Bitmask of events we want kernel to monitor (EPOLLIN, etc.)
-		Fd:     int32(fd),  // Target file descriptor to track
+		Events: events,    // Bitmask of events we want kernel to monitor (EPOLLIN, etc.)
+		Fd:     int32(fd), // Target file descriptor to track
 	}
 
 	if err := unix.EpollCtl(
@@ -149,7 +149,7 @@ func (p *Poller) Unregister(fd int) error {
 //
 // Parameters:
 //   - timeoutMS : Timeout in milliseconds. -1 means block indefinitely until an event triggers.
-//                 Positive values (e.g. 100) mean wait up to 100ms before returning empty event slice.
+//     Positive values (e.g. 100) mean wait up to 100ms before returning empty event slice.
 //
 // Signal Handling:
 //   - If interrupted by an OS signal (EINTR), it automatically retries instead of crashing.
@@ -160,9 +160,9 @@ func (p *Poller) Wait(timeoutMS int) ([]Event, error) {
 	for {
 		// epoll_wait populates 'events' slice and returns 'n' (number of ready FDs)
 		n, err := unix.EpollWait(
-			p.epfd,      // Epoll handle
-			events,      // Buffer slice to populate with ready events
-			timeoutMS,   // Timeout in ms (-1 = block infinitely, >0 = timeout in ms)
+			p.epfd,    // Epoll handle
+			events,    // Buffer slice to populate with ready events
+			timeoutMS, // Timeout in ms (-1 = block infinitely, >0 = timeout in ms)
 		)
 
 		if err != nil {
@@ -179,8 +179,8 @@ func (p *Poller) Wait(timeoutMS int) ([]Event, error) {
 		ready := make([]Event, 0, n)
 		for i := 0; i < n; i++ {
 			ready = append(ready, Event{
-				FD:     int(events[i].Fd),     // The ready socket/listener FD
-				Events: events[i].Events,     // Bitmask of ready events (EPOLLIN, EPOLLOUT, etc.)
+				FD:     int(events[i].Fd), // The ready socket/listener FD
+				Events: events[i].Events,  // Bitmask of ready events (EPOLLIN, EPOLLOUT, etc.)
 			})
 		}
 

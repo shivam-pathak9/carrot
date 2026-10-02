@@ -1,8 +1,8 @@
 package command
 
 import (
-	"github.com/shivampathak/carrot/internal/protocol/resp"
-	"github.com/shivampathak/carrot/internal/storage"
+	"github.com/shivam-pathak9/carrot/internal/protocol/resp"
+	"github.com/shivam-pathak9/carrot/internal/storage"
 )
 
 // handleDel executes the DEL command.

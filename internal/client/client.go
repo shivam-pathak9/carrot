@@ -2,8 +2,10 @@ package client
 
 import (
 	"bufio"
-	"github.com/shivampathak/carrot/internal/protocol/resp"
 	"net"
+	"time"
+
+	"github.com/shivam-pathak9/carrot/internal/protocol/resp"
 )
 
 // conn : The underlying TCP connection.
@@ -91,6 +93,13 @@ func (c *Client) Flush() error {
 	// be sent after handling a request, therefore the server
 	// explicitly calls `Flush()` once per reply.
 	return c.writer.Flush()
+}
+
+func (c *Client) SetReadDeadline(deadline time.Time) error {
+	if c.conn == nil {
+		return nil
+	}
+	return c.conn.SetReadDeadline(deadline)
 }
 
 func (c *Client) RemoteAddr() net.Addr {

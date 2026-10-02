@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/shivampathak/carrot/internal/protocol/resp"
+	"github.com/shivam-pathak9/carrot/internal/protocol/resp"
 )
 
 type Parser struct{}

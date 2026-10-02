@@ -3,6 +3,7 @@ package resp
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -218,6 +219,38 @@ func TestDecodeEmptyArray(t *testing.T) {
 	}
 	if len(value.Array) != 0 {
 		t.Errorf("Expected empty array, got length %d", len(value.Array))
+	}
+}
+
+func TestDecodeRejectsOversizedLine(t *testing.T) {
+	payload := strings.Repeat("a", maxRESPLineLength+1)
+	reader := bufio.NewReader(strings.NewReader(payload + "\r\n"))
+	decoder := NewDecoder(reader)
+
+	_, err := decoder.Decode()
+	if err == nil {
+		t.Fatal("expected oversized inline line to be rejected")
+	}
+}
+
+func TestDecodeRejectsOversizedBulkString(t *testing.T) {
+	payload := strings.Repeat("a", maxBulkStringLength+1)
+	reader := bufio.NewReader(strings.NewReader(fmt.Sprintf("$%d\r\n%s\r\n", len(payload), payload)))
+	decoder := NewDecoder(reader)
+
+	_, err := decoder.Decode()
+	if err == nil {
+		t.Fatal("expected oversized bulk string to be rejected")
+	}
+}
+
+func TestDecodeRejectsOversizedArray(t *testing.T) {
+	reader := bufio.NewReader(strings.NewReader(fmt.Sprintf("*%d\r\n", maxArrayLength+1)))
+	decoder := NewDecoder(reader)
+
+	_, err := decoder.Decode()
+	if err == nil {
+		t.Fatal("expected oversized array to be rejected")
 	}
 }
 

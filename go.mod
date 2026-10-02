@@ -1,4 +1,4 @@
-module github.com/shivampathak/carrot
+module github.com/shivam-pathak9/carrot
 
 go 1.26.4
 

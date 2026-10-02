@@ -1,6 +1,6 @@
 #  Carrot Reactor: Event Loop & System Call Engine (HLD & LLD)
 
-This package (`internal/reactor`) implements a high-performance, single-threaded **Reactor Event Loop** pattern using Linux native `epoll` system calls (`golang.org/x/sys/unix`).
+This package (`internal/reactor`) implements a single-threaded **Reactor Event Loop** pattern using Linux native `epoll` system calls (`golang.org/x/sys/unix`).
 
 It provides non-blocking, asynchronous I/O multiplexing for TCP client connections—similar to the core networking architecture used by Redis, Nginx, and Node.js.
 

@@ -1,27 +1,48 @@
 package resp
 
 import (
+	"bufio"
+	"errors"
 	"fmt"
 )
 
+const (
+	maxRESPLineLength   = 16 * 1024
+	maxBulkStringLength = 1 << 20
+	maxArrayLength      = 1024
+)
+
 func (d *Decoder) readLine() (string, error) {
-	// readLine reads a single CRLF-terminated line (without the CRLF)
-	// and validates that the line ends with CRLF as required by RESP.
-	// It uses `ReadString('\n')` which returns data up to and
-	// including the trailing '\n'. We validate the preceding byte
-	// is '\r' to ensure correct CRLF termination.
-	line, err := d.reader.ReadString('\n')
-	if err != nil {
-		return "", err
+	// readLine reads a single CRLF-terminated line without the terminating CRLF.
+	// It bounds the total line length so a malicious client cannot force us to
+	// allocate unbounded memory while reading a response header.
+	var line []byte
+	for {
+		chunk, err := d.reader.ReadSlice('\n')
+		if len(chunk) > 0 {
+			line = append(line, chunk...)
+			if len(line) > maxRESPLineLength {
+				return "", fmt.Errorf("RESP line exceeds %d bytes", maxRESPLineLength)
+			}
+		}
+
+		if err == nil {
+			break
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
 	}
 
 	n := len(line)
-
 	if n < 2 || line[n-2] != '\r' || line[n-1] != '\n' {
 		return "", fmt.Errorf("invalid RESP line: expected CRLF")
 	}
 
-	return line[:n-2], nil
+	return string(line[:n-2]), nil
 }
 
 func (d *Decoder) expectCRLF() error {

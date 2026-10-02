@@ -8,13 +8,13 @@ import (
 	"net"
 	"strconv"
 
-	"github.com/shivampathak/carrot/internal/command"
-	"github.com/shivampathak/carrot/internal/config"
-	"github.com/shivampathak/carrot/internal/storage"
+	"github.com/shivam-pathak9/carrot/internal/command"
+	"github.com/shivam-pathak9/carrot/internal/config"
+	"github.com/shivam-pathak9/carrot/internal/storage"
 	"golang.org/x/sys/unix"
 )
 
-// Server implements a high-performance TCP server driven by the epoll Reactor EventLoop.
+// Server implements a TCP server driven by the epoll Reactor EventLoop.
 //
 // Struct Fields & Why they exist:
 //   - config    : Server configuration holding network IP host (e.g. "0.0.0.0") and TCP port (e.g. "6379").
@@ -49,13 +49,13 @@ func NewServer(cfg config.Config) *Server {
 // Start initializes the non-blocking listening socket via system calls, registers it with epoll, and runs the EventLoop.
 //
 // Step-by-Step System Call Setup:
-//   1. unix.Socket      : Creates IPv4, non-blocking TCP socket file descriptor.
-//   2. unix.SetsockoptInt: Configures SO_REUSEADDR socket option.
-//   3. unix.Bind        : Binds listener socket FD to target IP address and TCP port.
-//   4. unix.Listen      : Marks socket FD as passive listener with connection backlog queue of 128.
-//   5. NewPoller        : Creates epoll instance via unix.EpollCreate1.
-//   6. poller.Register  : Registers listener socket FD in epoll interest list for EPOLLIN (incoming connections).
-//   7. eventLoop.Run    : Starts infinite epoll_wait event loop with Active Expiration cycle.
+//  1. unix.Socket      : Creates IPv4, non-blocking TCP socket file descriptor.
+//  2. unix.SetsockoptInt: Configures SO_REUSEADDR socket option.
+//  3. unix.Bind        : Binds listener socket FD to target IP address and TCP port.
+//  4. unix.Listen      : Marks socket FD as passive listener with connection backlog queue of 128.
+//  5. NewPoller        : Creates epoll instance via unix.EpollCreate1.
+//  6. poller.Register  : Registers listener socket FD in epoll interest list for EPOLLIN (incoming connections).
+//  7. eventLoop.Run    : Starts infinite epoll_wait event loop with Active Expiration cycle.
 func (s *Server) Start() error {
 	// Parse port string configuration to integer
 	portInt, err := strconv.Atoi(s.config.Port)

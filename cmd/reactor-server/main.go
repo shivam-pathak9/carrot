@@ -5,8 +5,8 @@ package main
 import (
 	"log"
 
-	"github.com/shivampathak/carrot/internal/config"
-	"github.com/shivampathak/carrot/internal/reactor"
+	"github.com/shivam-pathak9/carrot/internal/config"
+	"github.com/shivam-pathak9/carrot/internal/reactor"
 )
 
 func main() {

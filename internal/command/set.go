@@ -5,8 +5,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/shivampathak/carrot/internal/protocol/resp"
-	"github.com/shivampathak/carrot/internal/storage"
+	"github.com/shivam-pathak9/carrot/internal/protocol/resp"
+	"github.com/shivam-pathak9/carrot/internal/storage"
 )
 
 // handleSet executes the SET command.

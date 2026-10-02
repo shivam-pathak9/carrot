@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/shivampathak/carrot/internal/protocol/resp"
-	"github.com/shivampathak/carrot/internal/storage"
+	"github.com/shivam-pathak9/carrot/internal/protocol/resp"
+	"github.com/shivam-pathak9/carrot/internal/storage"
 )
 
 // Executor is responsible for implementing the server-side behavior of supported commands.

@@ -38,6 +38,9 @@ func (d *Decoder) decodeArray() (Value, error) {
 	if count < -1 {
 		return Value{}, fmt.Errorf("invalid array length %d", count)
 	}
+	if count > maxArrayLength {
+		return Value{}, fmt.Errorf("array length %d exceeds max allowed %d", count, maxArrayLength)
+	}
 
 	values := make([]Value, 0, count)
 

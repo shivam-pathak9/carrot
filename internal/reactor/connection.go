@@ -10,9 +10,10 @@ import (
 	"io"
 	"net"
 	"syscall"
+	"time"
 
-	"github.com/shivampathak/carrot/internal/command"
-	"github.com/shivampathak/carrot/internal/protocol/resp"
+	"github.com/shivam-pathak9/carrot/internal/command"
+	"github.com/shivam-pathak9/carrot/internal/protocol/resp"
 	"golang.org/x/sys/unix"
 )
 
@@ -20,24 +21,30 @@ import (
 //
 // Struct Fields & Why they are part of Connection:
 //   - fd       : The OS file descriptor integer for this specific client socket (e.g. fd=5).
-//                Used for non-blocking read (`unix.Read`) and write (`unix.Write`) operations.
+//     Used for non-blocking read (`unix.Read`) and write (`unix.Write`) operations.
 //   - poller   : Pointer to shared Poller instance. Needed to dynamically modify epoll interest flags
-//                (e.g., adding EPOLLOUT when outbound buffer cannot be flushed immediately).
+//     (e.g., adding EPOLLOUT when outbound buffer cannot be flushed immediately).
 //   - parser   : Pointer to shared command.Parser. Parses decoded RESP Values into executable Command objects.
 //   - executor : Pointer to shared command.Executor. Executes commands (like PING) and returns RESP response Values.
 //   - inBuf    : Memory byte buffer accumulating unparsed incoming bytes received from non-blocking socket reads.
-//                Crucial for handling partial TCP frame delivery (TCP segmentation).
+//     Crucial for handling partial TCP frame delivery (TCP segmentation).
 //   - outBuf   : Memory byte buffer queuing serialized RESP response bytes waiting to be sent to client socket.
-//                Crucial for non-blocking socket writes when OS TCP socket send buffer is temporarily full.
+//     Crucial for non-blocking socket writes when OS TCP socket send buffer is temporarily full.
 //   - isClosed : Guard flag ensuring idempotent close operations and preventing operations on closed FDs.
-type Connection struct {
-	fd       int              // OS File descriptor representing client socket
-	poller   *Poller          // Epoll handle to update event interest masks
-	parser   *command.Parser  // Shared RESP -> Command parser
-	executor *command.Executor// Shared Command -> RESP response executor
+const (
+	maxInboundBufferSize = 1 << 20 // 1 MiB cap to prevent unbounded inBuf growth from malicious clients
+	idleTimeout          = 30 * time.Second
+)
 
-	inBuf  bytes.Buffer // Inbound stream buffer (accumulates partial TCP frames)
-	outBuf bytes.Buffer // Outbound stream buffer (queues pending socket writes)
+type Connection struct {
+	fd       int               // OS File descriptor representing client socket
+	poller   *Poller           // Epoll handle to update event interest masks
+	parser   *command.Parser   // Shared RESP -> Command parser
+	executor *command.Executor // Shared Command -> RESP response executor
+
+	inBuf        bytes.Buffer // Inbound stream buffer (accumulates partial TCP frames)
+	outBuf       bytes.Buffer // Outbound stream buffer (queues pending socket writes)
+	lastActivity time.Time    // Tracks last successful read/write activity for idle disconnects
 
 	isClosed bool // Closed status safety flag
 }
@@ -51,10 +58,11 @@ type Connection struct {
 //   - executor: Reference to command executor.
 func NewConnection(fd int, poller *Poller, parser *command.Parser, executor *command.Executor) *Connection {
 	return &Connection{
-		fd:       fd,
-		poller:   poller,
-		parser:   parser,
-		executor: executor,
+		fd:           fd,
+		poller:       poller,
+		parser:       parser,
+		executor:     executor,
+		lastActivity: time.Now(),
 	}
 }
 
@@ -63,19 +71,17 @@ func (c *Connection) FD() int {
 	return c.fd
 }
 
-// OnRead is triggered by the EventLoop whenever epoll signals read readiness (EPOLLIN).
+// OnRead drains available socket data and converts it into RESP commands when a full request is present.
 //
-// Flow:
-//   1. Performs non-blocking unix.Read() in a loop into a scratch buffer (`buf`).
-//   2. Appends read bytes into `c.inBuf`.
-//   3. Handles non-blocking system call return codes:
-//      - `EAGAIN` / `EWOULDBLOCK`: Socket read buffer is currently drained. Break loop.
-//      - `EINTR`: Interrupted by OS signal. Retry read.
-//      - `n == 0`: Client closed connection gracefully (EOF). Return io.EOF.
-//   4. Triggers `processCommands()` to parse and execute any complete RESP commands accumulated in `c.inBuf`.
+// The reactor reads into a fixed-size scratch buffer until the socket reports no more readable bytes,
+// then it tries to parse and execute any complete RESP frames already buffered in memory. Partial frames
+// are left in c.inBuf until more data arrives.
 func (c *Connection) OnRead() error {
 	if c.isClosed {
 		return errors.New("connection closed")
+	}
+	if time.Since(c.lastActivity) > idleTimeout {
+		return fmt.Errorf("idle timeout")
 	}
 
 	// 4KB temporary stack buffer for draining non-blocking socket read queue
@@ -84,7 +90,11 @@ func (c *Connection) OnRead() error {
 		// unix.Read performs raw, non-blocking read system call on socket file descriptor (c.fd)
 		n, err := unix.Read(c.fd, buf)
 		if n > 0 {
+			if c.inBuf.Len()+n > maxInboundBufferSize {
+				return fmt.Errorf("input buffer limit exceeded on fd %d", c.fd)
+			}
 			c.inBuf.Write(buf[:n]) // Append read bytes into inBuf
+			c.lastActivity = time.Now()
 		}
 
 		if err != nil {
@@ -111,14 +121,11 @@ func (c *Connection) OnRead() error {
 	return c.processCommands()
 }
 
-// processCommands parses RESP protocol values from `c.inBuf`, executes them, and queues responses into `c.outBuf`.
+// processCommands tries to decode and execute one or more RESP commands pending in c.inBuf.
 //
-// Partial Network Packet & Frame Accumulation Strategy:
-//   - A single TCP read may contain partial commands (e.g. "*1\r\n$4\r\nPIN") or multiple combined commands.
-//   - We peek into `c.inBuf` using a `bytes.Reader` snapshot.
-//   - If `decoder.Decode()` encounters `io.EOF` or `io.ErrUnexpectedEOF`, it means the command payload is incomplete.
-//     We leave unparsed bytes in `c.inBuf` and wait for the next EPOLLIN event to deliver remaining bytes!
-//   - If decoding succeeds, we advance `c.inBuf` by the exact number of consumed bytes, parse command, execute, and write response.
+// It handles partial TCP packets safely by leaving incomplete frames in the buffer until the next read.
+// A successful decode advances the buffer by exactly the number of bytes consumed, so pipelined commands
+// are processed in order without skipping data.
 func (c *Connection) processCommands() error {
 	for c.inBuf.Len() > 0 {
 		raw := c.inBuf.Bytes()                // Inspect current byte slice snapshot in inBuf
@@ -193,19 +200,18 @@ func (c *Connection) writeResponse(val resp.Value) {
 	}
 }
 
-// Flush writes queued response bytes from `c.outBuf` to non-blocking client socket using unix.Write.
+// Flush sends any queued response bytes to the client socket.
 //
-// Epoll Interest Handling for Non-Blocking Writes:
-//   - Calls `unix.Write(c.fd, bytes)` in a loop.
-//   - If all bytes are written (`c.outBuf.Len() == 0`):
-//     Resets epoll event mask to `DefaultEventMask` (EPOLLIN | EPOLLERR | EPOLLRDHUP) — removing EPOLLOUT interest.
-//   - If OS TCP socket send buffer is full (`err == EAGAIN` or `EWOULDBLOCK`):
-//     Modifies epoll event mask to include `unix.EPOLLOUT`. When OS socket buffer has space,
-//     epoll will wake up EventLoop, which calls `OnWrite()` to finish sending remaining bytes!
+// If the socket becomes temporarily full, this method registers EPOLLOUT so the reactor can resume the
+// write once the kernel reports the socket is writable again. The write loop continues until all queued
+// bytes are drained or the socket is marked non-writable.
 func (c *Connection) Flush() error {
 	for c.outBuf.Len() > 0 {
 		// Non-blocking write system call to client socket FD
 		n, err := unix.Write(c.fd, c.outBuf.Bytes())
+		if n > 0 {
+			c.lastActivity = time.Now()
+		}
 		if n > 0 {
 			c.outBuf.Next(n) // Drain successfully written bytes from outBuf
 		}
