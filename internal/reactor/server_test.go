@@ -187,3 +187,21 @@ func TestReactorStopsAndClosesIdleClients(t *testing.T) {
 		t.Fatal("reactor did not stop")
 	}
 }
+
+func TestReactorIPv6Binding(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Host = "::1"
+	cfg.Port = "0"
+	cfg.ReadTimeout = time.Second
+	srv, _ := startTestReactor(t, cfg)
+	conn, err := net.Dial("tcp", srv.Addr().String())
+	if err != nil {
+		t.Skipf("IPv6 loopback dial failed (system may lack IPv6): %v", err)
+		return
+	}
+	defer conn.Close()
+
+	if got := reactorCommand(t, conn, "PING"); got.Type != resp.SimpleString || got.String != "PONG" {
+		t.Fatalf("PING response over IPv6 = %+v", got)
+	}
+}

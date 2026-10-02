@@ -15,6 +15,11 @@ type Obj struct {
 	list      listValue
 }
 
+// IsExpired reports whether the object has an expiration timestamp set and is expired as of time `now`.
+func (o Obj) IsExpired(now time.Time) bool {
+	return !o.ExpiresAt.IsZero() && !now.Before(o.ExpiresAt)
+}
+
 // ValueKind identifies the Redis-style value type stored at a key.
 type ValueKind uint8
 
@@ -23,23 +28,68 @@ const (
 	ListKind
 )
 
-// Store is the in-memory typed key-value database used by Carrot.
-//
-// It keeps a single Go map guarded by a mutex. This is intentionally simple and safe for the
-// current server design: all store access is synchronized, and the reactor path may also trigger
-// background expiration sweeps while client handlers are running.
-// Store is the shared, mutex-protected database used by command executors.
-// Values are typed so a command can reject operations against the wrong kind.
-type Store struct {
+// numShards specifies the number of independent memory partitions in the store.
+// 256 shards ensure high concurrency by dividing key access across 256 separate RWMutexes.
+const numShards = 256
+
+// shard represents an isolated partition of the storage engine containing its own RWMutex and map.
+type shard struct {
 	mu   sync.RWMutex
 	data map[string]Obj
 }
 
-// NewStore constructs and initializes a new Store instance.
-func NewStore() *Store {
-	return &Store{
-		data: make(map[string]Obj),
+// Store is the in-memory typed key-value database used by Carrot.
+//
+// DESIGN DECISION: LOCK STRIPING / SHARDING FOR MULTI-CORE SCALABILITY
+// ------------------------------------------------------------------
+// Issue & Motivation:
+// A single global sync.RWMutex guarding a single map[string]Obj creates severe lock contention
+// under high concurrent read/write throughput on multi-core CPUs. Every concurrent operation
+// (SET, GET, DEL, LPUSH, etc.) contends for the same single lock instance.
+//
+// Solution:
+// Store partitions the key space into 256 independent shards (shards [256]shard).
+// Each shard owns an independent RWMutex and map[string]Obj. Keys are mapped to shards using
+// the FNV-1a hash algorithm: shardIndex = fnv32a(key) % 256.
+//
+// Benefits:
+// 1. Concurrent operations targeting different keys execute in parallel across CPU cores without blocking.
+// 2. Background Active Expiration sweeps lock single shards briefly instead of locking the entire database.
+type Store struct {
+	shards [numShards]shard
+}
+
+// fnv32a hashes a string key into a 32-bit unsigned integer using FNV-1a.
+func fnv32a(key string) uint32 {
+	const (
+		offset32 = 2166136261
+		prime32  = 16777619
+	)
+	hash := uint32(offset32)
+	for i := 0; i < len(key); i++ {
+		hash ^= uint32(key[i])
+		hash *= prime32
 	}
+	return hash
+}
+
+// getShardIndex returns the index of the shard responsible for key.
+func (s *Store) getShardIndex(key string) int {
+	return int(fnv32a(key) % numShards)
+}
+
+// getShard returns a pointer to the shard responsible for key.
+func (s *Store) getShard(key string) *shard {
+	return &s.shards[s.getShardIndex(key)]
+}
+
+// NewStore constructs and initializes a new sharded Store instance.
+func NewStore() *Store {
+	s := &Store{}
+	for i := 0; i < numShards; i++ {
+		s.shards[i].data = make(map[string]Obj)
+	}
+	return s
 }
 
 // Set stores a value under key and optionally assigns an expiration timestamp.
@@ -47,15 +97,16 @@ func NewStore() *Store {
 // A ttl <= 0 means the key is persistent and will not expire unless explicitly removed or
 // overwritten by a later SET/DELETE operation.
 func (s *Store) Set(key string, value string, ttl time.Duration) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
 	var expiresAt time.Time
 	if ttl > 0 {
 		expiresAt = time.Now().Add(ttl)
 	}
 
-	s.data[key] = Obj{
+	sh.data[key] = Obj{
 		Value:     value,
 		ExpiresAt: expiresAt,
 	}
@@ -77,17 +128,19 @@ func (s *Store) Get(key string) (string, bool) {
 //   - -1: key exists without an expiration,
 //   - >=0: seconds remaining before expiry.
 func (s *Store) TTL(key string) int64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	obj, exists := s.data[key]
+	obj, exists := sh.data[key]
 	if !exists {
 		return -2
 	}
 
+	now := time.Now()
 	// Check passive expiration
-	if !obj.ExpiresAt.IsZero() && time.Now().After(obj.ExpiresAt) {
-		delete(s.data, key) // Passive deletion
+	if obj.IsExpired(now) {
+		delete(sh.data, key) // Passive deletion
 		return -2
 	}
 
@@ -97,7 +150,7 @@ func (s *Store) TTL(key string) int64 {
 
 	remaining := time.Until(obj.ExpiresAt).Seconds()
 	if remaining < 0 {
-		delete(s.data, key)
+		delete(sh.data, key)
 		return -2
 	}
 
@@ -108,21 +161,23 @@ func (s *Store) TTL(key string) int64 {
 //
 // If the key had already expired, it is treated as absent and removed lazily before returning false.
 func (s *Store) Del(key string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	obj, exists := s.data[key]
+	obj, exists := sh.data[key]
 	if !exists {
 		return false
 	}
 
+	now := time.Now()
 	// Check passive expiration
-	if !obj.ExpiresAt.IsZero() && time.Now().After(obj.ExpiresAt) {
-		delete(s.data, key) // Passive deletion
+	if obj.IsExpired(now) {
+		delete(sh.data, key) // Passive deletion
 		return false
 	}
 
-	delete(s.data, key)
+	delete(sh.data, key)
 	return true
 }
 
@@ -131,42 +186,37 @@ func (s *Store) Del(key string) bool {
 // A non-positive seconds value removes the key. If the key does not exist or is already expired,
 // the call returns false.
 func (s *Store) Expire(key string, seconds int64) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	obj, exists := s.data[key]
+	obj, exists := sh.data[key]
 	if !exists {
 		return false
 	}
 
+	now := time.Now()
 	// Check if the key is already passively expired
-	if !obj.ExpiresAt.IsZero() && time.Now().After(obj.ExpiresAt) {
-		delete(s.data, key)
+	if obj.IsExpired(now) {
+		delete(sh.data, key)
 		return false
 	}
 
 	if seconds <= 0 {
-		delete(s.data, key)
+		delete(sh.data, key)
 		return true
 	}
 
 	obj.ExpiresAt = time.Now().Add(time.Duration(seconds) * time.Second)
-	s.data[key] = obj
+	sh.data[key] = obj
 	return true
 }
 
 // ActiveExpireCycle does a bounded cleanup pass for expired volatile keys.
 //
-// This is a lightweight maintenance sweep that helps avoid stale keys accumulating in memory when
-// they are never accessed again. It samples a small number of keys, removes those that are expired,
-// and stops when the time budget or a low-density condition is reached.
-//
-// The goal is not a full database scan; it is a bounded opportunistic cleanup that keeps the event loop
-// responsive while still reclaiming expired entries in the background.
+// It iterates across shards, acquiring a lock on one shard at a time to sample volatile entries.
+// This ensures background expiration sweeps never block client requests targeting other shards.
 func (s *Store) ActiveExpireCycle() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	const (
 		sampleSize     = 20                    // Number of volatile keys sampled per iteration
 		thresholdRatio = 0.25                  // 25% counter-limit threshold ratio (5 / 20)
@@ -178,53 +228,54 @@ func (s *Store) ActiveExpireCycle() int {
 	totalDeleted := 0
 
 	for iteration := 0; iteration < maxIterations; iteration++ {
-		// Enforce time budget cap to protect client I/O latency,
-		// including while iterating the map.
 		if time.Since(startTime) >= maxDuration {
 			break
 		}
 
 		expiredInSample := 0
 		sampledCount := 0
+		now := time.Now()
 
-		// Iterate over map entries to extract a random sample of keys with TTLs.
-		// In Go, map iteration order is randomized by the runtime, providing natural pseudo-random sampling.
-		for key, obj := range s.data {
+		for shIdx := 0; shIdx < numShards; shIdx++ {
 			if time.Since(startTime) >= maxDuration {
 				break
 			}
+			sh := &s.shards[shIdx]
 
-			// Skip persistent keys (ExpiresAt is zero)
-			if obj.ExpiresAt.IsZero() {
-				continue
+			sh.mu.Lock()
+			for key, obj := range sh.data {
+				if time.Since(startTime) >= maxDuration {
+					break
+				}
+
+				if obj.ExpiresAt.IsZero() {
+					continue
+				}
+
+				sampledCount++
+
+				if obj.IsExpired(now) {
+					delete(sh.data, key)
+					expiredInSample++
+					totalDeleted++
+				}
+
+				if sampledCount >= sampleSize {
+					break
+				}
 			}
+			sh.mu.Unlock()
 
-			sampledCount++
-
-			// Check if key is expired
-			if time.Now().After(obj.ExpiresAt) {
-				delete(s.data, key)
-				expiredInSample++
-				totalDeleted++
-			}
-
-			// Stop when sample size N = 20 is reached
 			if sampledCount >= sampleSize {
 				break
 			}
 		}
 
-		// If no volatile keys were found in database, exit early
 		if sampledCount == 0 {
 			break
 		}
 
-		// Calculate sample expiration ratio p_hat
 		ratio := float64(expiredInSample) / float64(sampledCount)
-
-		// THE 25% COUNTER-LIMIT CHECK:
-		// If ratio <= 25%, global expired key density is low enough that further sweeping
-		// yields diminishing returns. Exit cycle until next tick.
 		if ratio <= thresholdRatio {
 			break
 		}
@@ -235,4 +286,21 @@ func (s *Store) ActiveExpireCycle() int {
 	}
 
 	return totalDeleted
+}
+
+// getRawObj returns the internal Obj stored at key (used for tests and internal assertions).
+func (s *Store) getRawObj(key string) (Obj, bool) {
+	sh := s.getShard(key)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	obj, exists := sh.data[key]
+	return obj, exists
+}
+
+// setRawObj directly sets an internal Obj for key (used for tests to seed expired state).
+func (s *Store) setRawObj(key string, obj Obj) {
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	sh.data[key] = obj
 }

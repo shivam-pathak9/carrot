@@ -82,53 +82,63 @@ func (s *Server) Start() error {
 		return fmt.Errorf("invalid port %q: %w", s.config.Port, err)
 	}
 
+	// Resolve listen address (supports both IPv4 and IPv6)
+	tcpAddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(s.config.Host, strconv.Itoa(portInt)))
+	if err != nil {
+		return fmt.Errorf("invalid listen address %q: %w", s.config.Host, err)
+	}
+
+	var (
+		domain int
+		sa     unix.Sockaddr
+	)
+
+	if ip4 := tcpAddr.IP.To4(); ip4 != nil {
+		domain = unix.AF_INET
+		var addr [4]byte
+		copy(addr[:], ip4)
+		sa = &unix.SockaddrInet4{
+			Port: portInt,
+			Addr: addr,
+		}
+	} else if ip6 := tcpAddr.IP.To16(); ip6 != nil {
+		domain = unix.AF_INET6
+		var addr [16]byte
+		copy(addr[:], ip6)
+		sa = &unix.SockaddrInet6{
+			Port:   portInt,
+			Addr:   addr,
+			ZoneId: zoneToInt(tcpAddr.Zone),
+		}
+	} else {
+		return fmt.Errorf("unsupported IP address %q", s.config.Host)
+	}
+
 	// Step 1: Create non-blocking listening TCP socket via low-level system call
-	// Flags breakdown:
-	//   - unix.AF_INET       : IPv4 protocol family.
-	//   - unix.SOCK_STREAM   : Full-duplex byte stream TCP protocol.
-	//   - unix.SOCK_NONBLOCK : Sets non-blocking I/O mode on created socket descriptor.
-	//   - unix.SOCK_CLOEXEC  : Sets Close-on-Exec flag so child processes do not inherit listening socket.
-	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
+	fd, err := unix.Socket(domain, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
 		return fmt.Errorf("failed to create socket: %w", err)
 	}
 	s.listenerFD = fd // Store listener socket file descriptor (e.g. fd=3)
 
 	// Step 2: Set SO_REUSEADDR socket option
-	// Why SO_REUSEADDR:
-	//   Allows immediate rebinding to host:port even if socket is currently in TCP TIME_WAIT state after server restart.
 	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
 		_ = unix.Close(fd)
 		return fmt.Errorf("failed to set SO_REUSEADDR: %w", err)
 	}
 
-	// Step 3: Bind listener to the configured IPv4 address.
-	tcpAddr, err := net.ResolveTCPAddr("tcp4", net.JoinHostPort(s.config.Host, strconv.Itoa(portInt)))
-	if err != nil {
-		_ = unix.Close(fd)
-		return fmt.Errorf("invalid IPv4 listen address: %w", err)
-	}
-	ip := tcpAddr.IP
-	var addr [4]byte
-	if ip4 := ip.To4(); ip4 != nil {
-		copy(addr[:], ip4)
-	} else {
-		_ = unix.Close(fd)
-		return fmt.Errorf("reactor server requires an IPv4 host")
+	// For IPv6 wildcard binding ("::"), enable dual-stack support
+	if domain == unix.AF_INET6 && tcpAddr.IP.IsUnspecified() {
+		_ = unix.SetsockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_V6ONLY, 0)
 	}
 
-	sa := &unix.SockaddrInet4{
-		Port: portInt,
-		Addr: addr,
-	}
-
+	// Step 3: Bind listener to the configured IPv4/IPv6 address
 	if err := unix.Bind(fd, sa); err != nil {
 		_ = unix.Close(fd)
 		return fmt.Errorf("failed to bind socket to %s:%s: %w", s.config.Host, s.config.Port, err)
 	}
 
 	// Step 4: Listen on socket FD with connection backlog limit of 128
-	// Marks the socket FD as a passive listening socket for accepting incoming client TCP connections.
 	if err := unix.Listen(fd, 128); err != nil {
 		_ = unix.Close(fd)
 		return fmt.Errorf("failed to listen on socket: %w", err)
@@ -138,9 +148,14 @@ func (s *Server) Start() error {
 		_ = unix.Close(fd)
 		return fmt.Errorf("get listener address: %w", err)
 	}
-	if addr4, ok := sockaddr.(*unix.SockaddrInet4); ok {
+	switch sa := sockaddr.(type) {
+	case *unix.SockaddrInet4:
 		s.mu.Lock()
-		s.addr = &net.TCPAddr{IP: net.IP(addr4.Addr[:]), Port: addr4.Port}
+		s.addr = &net.TCPAddr{IP: net.IP(sa.Addr[:]), Port: sa.Port}
+		s.mu.Unlock()
+	case *unix.SockaddrInet6:
+		s.mu.Lock()
+		s.addr = &net.TCPAddr{IP: net.IP(sa.Addr[:]), Port: sa.Port, Zone: zoneToString(sa.ZoneId)}
 		s.mu.Unlock()
 	}
 
@@ -170,4 +185,24 @@ func (s *Server) Start() error {
 // Stop cleanly stops the reactor server and closes listener socket resources.
 func (s *Server) Stop() {
 	s.stopOnce.Do(func() { close(s.stopChan) })
+}
+
+func zoneToInt(zone string) uint32 {
+	if zone == "" {
+		return 0
+	}
+	if ifi, err := net.InterfaceByName(zone); err == nil {
+		return uint32(ifi.Index)
+	}
+	return 0
+}
+
+func zoneToString(zoneID uint32) string {
+	if zoneID == 0 {
+		return ""
+	}
+	if ifi, err := net.InterfaceByIndex(int(zoneID)); err == nil {
+		return ifi.Name
+	}
+	return ""
 }

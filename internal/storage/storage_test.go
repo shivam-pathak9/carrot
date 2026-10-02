@@ -427,7 +427,7 @@ func TestPassiveDeletionOnExpiredAccess(t *testing.T) {
 	if value != "" {
 		t.Fatalf("expected empty value for expired key, got %q", value)
 	}
-	if _, exists := store.data["get_expired"]; exists {
+	if _, exists := store.getRawObj("get_expired"); exists {
 		t.Fatal("passive deletion should remove expired key from the map")
 	}
 
@@ -437,7 +437,7 @@ func TestPassiveDeletionOnExpiredAccess(t *testing.T) {
 	if ttl := store.TTL("ttl_expired"); ttl != -2 {
 		t.Fatalf("expected TTL -2 for expired key, got %d", ttl)
 	}
-	if _, exists := store.data["ttl_expired"]; exists {
+	if _, exists := store.getRawObj("ttl_expired"); exists {
 		t.Fatal("TTL should remove expired key from the map")
 	}
 
@@ -447,7 +447,7 @@ func TestPassiveDeletionOnExpiredAccess(t *testing.T) {
 	if deleted := store.Del("del_expired"); deleted {
 		t.Fatal("expired key should be treated as already deleted and return false")
 	}
-	if _, exists := store.data["del_expired"]; exists {
+	if _, exists := store.getRawObj("del_expired"); exists {
 		t.Fatal("Del should remove expired key from the map")
 	}
 }
@@ -458,27 +458,27 @@ func TestActiveExpireCycleRemovesExpiredKeys(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		key := fmt.Sprintf("vol-%d", i)
 		if i < 6 {
-			store.data[key] = Obj{Value: "expired", ExpiresAt: time.Now().Add(-1 * time.Second)}
+			store.setRawObj(key, Obj{Value: "expired", ExpiresAt: time.Now().Add(-1 * time.Second)})
 			continue
 		}
-		store.data[key] = Obj{Value: fmt.Sprintf("live-%d", i), ExpiresAt: time.Now().Add(5 * time.Second)}
+		store.setRawObj(key, Obj{Value: fmt.Sprintf("live-%d", i), ExpiresAt: time.Now().Add(5 * time.Second)})
 	}
-	store.data["persistent"] = Obj{Value: "keep", ExpiresAt: time.Time{}}
+	store.setRawObj("persistent", Obj{Value: "keep", ExpiresAt: time.Time{}})
 
 	deleted := store.ActiveExpireCycle()
 	if deleted != 6 {
 		t.Fatalf("expected active expiry to delete 6 expired keys, got %d", deleted)
 	}
-	if _, exists := store.data["persistent"]; !exists {
+	if _, exists := store.getRawObj("persistent"); !exists {
 		t.Fatal("persistent keys should be ignored by active expiry")
 	}
 	for i := 0; i < 6; i++ {
-		if _, exists := store.data[fmt.Sprintf("vol-%d", i)]; exists {
+		if _, exists := store.getRawObj(fmt.Sprintf("vol-%d", i)); exists {
 			t.Fatalf("expired key vol-%d should have been removed by active expiry", i)
 		}
 	}
 	for i := 6; i < 20; i++ {
-		if _, exists := store.data[fmt.Sprintf("vol-%d", i)]; !exists {
+		if _, exists := store.getRawObj(fmt.Sprintf("vol-%d", i)); !exists {
 			t.Fatalf("active key vol-%d should remain after expiry cycle", i)
 		}
 	}
@@ -490,10 +490,10 @@ func TestActiveExpireCycleStopsBelowThreshold(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		key := fmt.Sprintf("edge-%d", i)
 		if i < 4 {
-			store.data[key] = Obj{Value: "expired", ExpiresAt: time.Now().Add(-1 * time.Second)}
+			store.setRawObj(key, Obj{Value: "expired", ExpiresAt: time.Now().Add(-1 * time.Second)})
 			continue
 		}
-		store.data[key] = Obj{Value: fmt.Sprintf("live-%d", i), ExpiresAt: time.Now().Add(5 * time.Second)}
+		store.setRawObj(key, Obj{Value: fmt.Sprintf("live-%d", i), ExpiresAt: time.Now().Add(5 * time.Second)})
 	}
 
 	deleted := store.ActiveExpireCycle()
@@ -501,12 +501,12 @@ func TestActiveExpireCycleStopsBelowThreshold(t *testing.T) {
 		t.Fatalf("expected 4 expired keys to be removed, got %d", deleted)
 	}
 	for i := 0; i < 4; i++ {
-		if _, exists := store.data[fmt.Sprintf("edge-%d", i)]; exists {
+		if _, exists := store.getRawObj(fmt.Sprintf("edge-%d", i)); exists {
 			t.Fatalf("expired key edge-%d should have been removed", i)
 		}
 	}
 	for i := 4; i < 20; i++ {
-		if _, exists := store.data[fmt.Sprintf("edge-%d", i)]; !exists {
+		if _, exists := store.getRawObj(fmt.Sprintf("edge-%d", i)); !exists {
 			t.Fatalf("live key edge-%d should still exist after active expiry", i)
 		}
 	}
@@ -514,12 +514,12 @@ func TestActiveExpireCycleStopsBelowThreshold(t *testing.T) {
 
 func TestExpireOnExpiredKeyReturnsFalse(t *testing.T) {
 	store := NewStore()
-	store.data["stale"] = Obj{Value: "value", ExpiresAt: time.Now().Add(-1 * time.Second)}
+	store.setRawObj("stale", Obj{Value: "value", ExpiresAt: time.Now().Add(-1 * time.Second)})
 
 	if ok := store.Expire("stale", 10); ok {
 		t.Fatal("expired key should be treated as already deleted")
 	}
-	if _, exists := store.data["stale"]; exists {
+	if _, exists := store.getRawObj("stale"); exists {
 		t.Fatal("Expire should remove an already expired key from the store")
 	}
 }

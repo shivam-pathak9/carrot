@@ -137,10 +137,10 @@ func (l *listValue) index(index int64) (int, bool) {
 	return int(index), true
 }
 
-func (s *Store) liveObjectLocked(key string) (Obj, bool) {
-	obj, exists := s.data[key]
-	if exists && !obj.ExpiresAt.IsZero() && !time.Now().Before(obj.ExpiresAt) {
-		delete(s.data, key)
+func (s *Store) liveObjectLocked(sh *shard, key string) (Obj, bool) {
+	obj, exists := sh.data[key]
+	if exists && obj.IsExpired(time.Now()) {
+		delete(sh.data, key)
 		return Obj{}, false
 	}
 	return obj, exists
@@ -148,10 +148,11 @@ func (s *Store) liveObjectLocked(key string) (Obj, bool) {
 
 // GetString returns a string value and reports WRONGTYPE for non-string keys.
 func (s *Store) GetString(key string) (string, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	obj, exists := s.liveObjectLocked(key)
+	obj, exists := s.liveObjectLocked(sh, key)
 	if !exists {
 		return "", false, nil
 	}
@@ -163,10 +164,11 @@ func (s *Store) GetString(key string) (string, bool, error) {
 
 // ListPush pushes values in argument order onto one end of a list.
 func (s *Store) ListPush(key string, values []string, left, onlyExisting bool) (int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	obj, exists := s.liveObjectLocked(key)
+	obj, exists := s.liveObjectLocked(sh, key)
 	if !exists {
 		if onlyExisting {
 			return 0, nil
@@ -179,16 +181,17 @@ func (s *Store) ListPush(key string, values []string, left, onlyExisting bool) (
 	for _, value := range values {
 		obj.list.push(value, left)
 	}
-	s.data[key] = obj
+	sh.data[key] = obj
 	return int64(obj.list.Len()), nil
 }
 
 // ListPop removes up to count values from one end of a list.
 func (s *Store) ListPop(key string, left bool, count int64) ([]string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	obj, exists := s.liveObjectLocked(key)
+	obj, exists := s.liveObjectLocked(sh, key)
 	if !exists {
 		return nil, nil
 	}
@@ -206,19 +209,20 @@ func (s *Store) ListPop(key string, left bool, count int64) ([]string, error) {
 		values = append(values, value)
 	}
 	if obj.list.Len() == 0 {
-		delete(s.data, key)
+		delete(sh.data, key)
 	} else {
-		s.data[key] = obj
+		sh.data[key] = obj
 	}
 	return values, nil
 }
 
 // ListLen returns zero for a missing list.
 func (s *Store) ListLen(key string) (int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	obj, exists := s.liveObjectLocked(key)
+	obj, exists := s.liveObjectLocked(sh, key)
 	if !exists {
 		return 0, nil
 	}
@@ -230,10 +234,11 @@ func (s *Store) ListLen(key string) (int64, error) {
 
 // ListRange returns the inclusive range from start to stop, supporting negative indexes.
 func (s *Store) ListRange(key string, start, stop int64) ([]string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	obj, exists := s.liveObjectLocked(key)
+	obj, exists := s.liveObjectLocked(sh, key)
 	if !exists {
 		return []string{}, nil
 	}
@@ -261,10 +266,11 @@ func (s *Store) ListRange(key string, start, stop int64) ([]string, error) {
 
 // ListIndex returns an item by index, supporting negative indexes.
 func (s *Store) ListIndex(key string, index int64) (string, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	obj, exists := s.liveObjectLocked(key)
+	obj, exists := s.liveObjectLocked(sh, key)
 	if !exists {
 		return "", false, nil
 	}
@@ -280,10 +286,11 @@ func (s *Store) ListIndex(key string, index int64) (string, bool, error) {
 
 // ListSet updates an item by index, supporting negative indexes.
 func (s *Store) ListSet(key string, index int64, value string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	obj, exists := s.liveObjectLocked(key)
+	obj, exists := s.liveObjectLocked(sh, key)
 	if !exists {
 		return ErrNoSuchKey
 	}
@@ -295,16 +302,17 @@ func (s *Store) ListSet(key string, index int64, value string) error {
 		return ErrListIndexRange
 	}
 	obj.list.set(i, value)
-	s.data[key] = obj
+	sh.data[key] = obj
 	return nil
 }
 
 // ListTrim keeps the inclusive range and removes the key when no elements remain.
 func (s *Store) ListTrim(key string, start, stop int64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	obj, exists := s.liveObjectLocked(key)
+	obj, exists := s.liveObjectLocked(sh, key)
 	if !exists {
 		return nil
 	}
@@ -325,20 +333,21 @@ func (s *Store) ListTrim(key string, start, stop int64) error {
 		stop = length - 1
 	}
 	if length == 0 || start >= length || start > stop {
-		delete(s.data, key)
+		delete(sh.data, key)
 		return nil
 	}
 	obj.list.replace(obj.list.rangeCopy(int(start), int(stop+1)))
-	s.data[key] = obj
+	sh.data[key] = obj
 	return nil
 }
 
 // ListRem removes count occurrences. A zero count removes every matching item.
 func (s *Store) ListRem(key string, count int64, value string) (int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	obj, exists := s.liveObjectLocked(key)
+	obj, exists := s.liveObjectLocked(sh, key)
 	if !exists {
 		return 0, nil
 	}
@@ -372,9 +381,9 @@ func (s *Store) ListRem(key string, count int64, value string) (int64, error) {
 		}
 	}
 	if obj.list.Len() == 0 {
-		delete(s.data, key)
+		delete(sh.data, key)
 	} else {
-		s.data[key] = obj
+		sh.data[key] = obj
 	}
 	return removed, nil
 }
@@ -382,10 +391,11 @@ func (s *Store) ListRem(key string, count int64, value string) (int64, error) {
 // ListInsert inserts value before or after the first matching pivot.
 // It returns zero for a missing key and -1 when the pivot is not present.
 func (s *Store) ListInsert(key, pivot, value string, before bool) (int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	obj, exists := s.liveObjectLocked(key)
+	obj, exists := s.liveObjectLocked(sh, key)
 	if !exists {
 		return 0, nil
 	}
@@ -402,7 +412,7 @@ func (s *Store) ListInsert(key, pivot, value string, before bool) (int64, error)
 			insertAt++
 		}
 		obj.list.insert(insertAt, value)
-		s.data[key] = obj
+		sh.data[key] = obj
 		return int64(obj.list.Len()), nil
 	}
 	return -1, nil
@@ -410,13 +420,14 @@ func (s *Store) ListInsert(key, pivot, value string, before bool) (int64, error)
 
 // ListPosition returns matching indexes using Redis LPOS rank/count/maxlen semantics.
 func (s *Store) ListPosition(key, value string, rank, count, maxLen int64) ([]int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
 	if rank == -1<<63 {
 		return nil, errors.New("invalid rank")
 	}
-	obj, exists := s.liveObjectLocked(key)
+	obj, exists := s.liveObjectLocked(sh, key)
 	if !exists {
 		return []int64{}, nil
 	}
@@ -454,12 +465,36 @@ func (s *Store) ListPosition(key, value string, rank, count, maxLen int64) ([]in
 }
 
 // ListMove atomically pops from one end of src and pushes onto one end of dst.
-// Both keys are checked and updated under the same store lock.
+// Both keys are checked and updated under shard locks acquired in sorted index order to prevent deadlocks.
 func (s *Store) ListMove(src, dst string, fromLeft, toLeft bool) (string, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	idx1 := s.getShardIndex(src)
+	idx2 := s.getShardIndex(dst)
 
-	source, exists := s.liveObjectLocked(src)
+	if idx1 == idx2 {
+		sh := &s.shards[idx1]
+		sh.mu.Lock()
+		defer sh.mu.Unlock()
+		return s.listMoveLocked(sh, sh, src, dst, fromLeft, toLeft)
+	}
+
+	// Always acquire lower shard index first to prevent deadlocks when concurrent LMOVE operations specify opposite key order.
+	if idx1 < idx2 {
+		s.shards[idx1].mu.Lock()
+		defer s.shards[idx1].mu.Unlock()
+		s.shards[idx2].mu.Lock()
+		defer s.shards[idx2].mu.Unlock()
+	} else {
+		s.shards[idx2].mu.Lock()
+		defer s.shards[idx2].mu.Unlock()
+		s.shards[idx1].mu.Lock()
+		defer s.shards[idx1].mu.Unlock()
+	}
+
+	return s.listMoveLocked(&s.shards[idx1], &s.shards[idx2], src, dst, fromLeft, toLeft)
+}
+
+func (s *Store) listMoveLocked(srcShard, dstShard *shard, src, dst string, fromLeft, toLeft bool) (string, bool, error) {
+	source, exists := s.liveObjectLocked(srcShard, src)
 	if !exists {
 		return "", false, nil
 	}
@@ -469,11 +504,11 @@ func (s *Store) ListMove(src, dst string, fromLeft, toLeft bool) (string, bool, 
 	if src == dst {
 		value, _ := source.list.pop(fromLeft)
 		source.list.push(value, toLeft)
-		s.data[src] = source
+		srcShard.data[src] = source
 		return value, true, nil
 	}
 
-	destination, destExists := s.liveObjectLocked(dst)
+	destination, destExists := s.liveObjectLocked(dstShard, dst)
 	if destExists && destination.Kind != ListKind {
 		return "", false, ErrWrongType
 	}
@@ -485,10 +520,10 @@ func (s *Store) ListMove(src, dst string, fromLeft, toLeft bool) (string, bool, 
 		destination.list.push(value, toLeft)
 	}
 	if source.list.Len() == 0 {
-		delete(s.data, src)
+		delete(srcShard.data, src)
 	} else {
-		s.data[src] = source
+		srcShard.data[src] = source
 	}
-	s.data[dst] = destination
+	dstShard.data[dst] = destination
 	return value, true, nil
 }
