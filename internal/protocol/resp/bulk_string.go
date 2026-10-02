@@ -60,6 +60,9 @@ func (d *Decoder) decodeBulkString() (Value, error) {
 	if length > maxBulkStringLength {
 		return Value{}, fmt.Errorf("bulk string length %d exceeds max allowed %d", length, maxBulkStringLength)
 	}
+	if err := d.consume(length + 2); err != nil {
+		return Value{}, err
+	}
 
 	// Read payload
 	buf := make([]byte, length)

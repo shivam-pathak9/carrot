@@ -1,3 +1,4 @@
+// parser.go validates RESP arrays and turns them into normalized commands.
 package command
 
 import (
@@ -9,6 +10,7 @@ import (
 
 type Parser struct{}
 
+// NewParser creates a stateless parser for RESP command arrays.
 func NewParser() *Parser {
 	// NewParser returns a new command parser. Parser has no state
 	// for now but is provided as a type to keep parsing logic
@@ -16,6 +18,9 @@ func NewParser() *Parser {
 	return &Parser{}
 }
 
+// Parse validates a RESP array and converts its bulk-string fields to a Command.
+// The command name is normalized to uppercase; arguments retain their original
+// spelling and order.
 func (p *Parser) Parse(value resp.Value) (Command, error) {
 	// Parse converts a RESP `Value` (expected to be an Array)
 	// into a `Command` with a name and arguments. It performs

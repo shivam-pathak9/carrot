@@ -1,3 +1,4 @@
+// Package resp decodes and encodes the RESP values used by the server protocol.
 package resp
 
 import "fmt"

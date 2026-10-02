@@ -5,8 +5,8 @@
 <h1 align="center">🥕 Carrot</h1>
 
 <p align="center">
-  <b>Carrot is a lightweight Redis-inspired in-memory server written in Go.</b><br/>
-  It provides a RESP-based command protocol, an in-memory key-value store, and two server implementations for different concurrency models.
+  <b>Carrot is a Redis-inspired single-node server written in Go.</b><br/>
+  It is an in-memory development project progressing toward production readiness; it is not currently safe for production data.
 </p>
 
 ---
@@ -16,8 +16,9 @@
 Carrot currently includes:
 
 - A RESP parser and encoder for Redis-style wire protocol messages
-- An in-memory storage layer with string values and TTL support
+- An in-memory storage layer with string and list values plus TTL support
 - Core commands: `PING`, `GET`, `SET`, `DEL`, `TTL`, and `EXPIRE`
+- Redis-style list commands including pushes, pops, ranges, indexed updates, trimming, removal, insertion, positions, and atomic moves
 - A per-connection goroutine server built with Go net listeners
 - A Linux epoll-based reactor server for non-blocking I/O
 - Scheduled background expiration cleanup for stale keys
@@ -39,7 +40,7 @@ Carrot currently includes:
 
 ## Supported behavior
 
-The server currently supports the Redis-like operations needed for a basic in-memory database:
+The server currently supports this Redis-inspired command subset:
 
 - `PING`
 - `SET key value [EX seconds|PX milliseconds]`
@@ -47,6 +48,16 @@ The server currently supports the Redis-like operations needed for a basic in-me
 - `DEL key [key ...]`
 - `TTL key`
 - `EXPIRE key seconds`
+
+List commands currently supported:
+
+- `LPUSH`, `RPUSH`, `LPUSHX`, `RPUSHX`
+- `LPOP`, `RPOP` (including count form)
+- `LLEN`, `LRANGE`, `LINDEX`, `LSET`, `LTRIM`
+- `LREM`, `LINSERT`, `LPOS`
+- `LMOVE`, `RPOPLPUSH`
+
+Blocking list commands (such as `BLPOP` and `BRPOP`) are not implemented.
 
 The storage layer also supports passive expiration on access and a bounded active expiration sweep for background cleanup.
 
@@ -60,37 +71,102 @@ Start the goroutine server:
 go run ./cmd/server
 ```
 
+The default bind address is `0.0.0.0`, which exposes the unauthenticated,
+unencrypted server on every network interface. Use loopback for local
+development; expose it only on a trusted, firewalled network:
+
+```bash
+go run ./cmd/server -host 127.0.0.1 -port 16379
+```
+
 Start the reactor server:
 
 ```bash
-go run ./cmd/reactor-server
+go run ./cmd/reactor-server -host 127.0.0.1 -port 16380
 ```
+
+Operational settings can be configured on either binary:
+
+```bash
+go run ./cmd/server \
+  -host 127.0.0.1 -port 16379 \
+  -max-connections 128 \
+  -max-request-bytes 2097152 \
+  -max-response-bytes 4194304 \
+  -read-timeout 30s -write-timeout 10s
+```
+
+Both binaries handle `SIGINT` and `SIGTERM` for shutdown. The standard server
+stops accepting connections and waits for active clients, closing them if its
+10-second shutdown window expires. The reactor closes its clients and epoll
+resources during shutdown. The epoll implementation currently supports IPv4
+addresses only.
 
 Run the test suite:
 
 ```bash
 go test ./...
+go test -race ./...
+go test -cover ./...
+go build ./...
+go vet ./...
 ```
+
+Server and reactor TCP integration tests run as part of `go test ./...`.
 
 ---
 
 ## Current status
 
-This is a solid MVP / early production-quality foundation for an in-memory Redis-like service. It is not yet a full Redis replacement.
+Carrot is an MVP and is **not production-ready**. It has no persistence or recovery; stored data is lost on process exit. It also has no authentication or transport encryption, and the default bind address is `0.0.0.0`. Use loopback for local testing and do not expose it to untrusted networks.
 
-The project is currently strongest in:
+The project currently demonstrates:
 
-- RESP compatibility for basic command flows
-- in-memory key-value storage and TTL logic
-- server architecture exploration and event-loop design
-- basic correctness coverage through Go tests
+- A documented subset of RESP and Redis-style string/list commands
+- In-memory typed storage and TTL behavior
+- Two networking models: goroutine-per-connection and Linux epoll
+- Unit-test coverage for storage, commands, RESP, and configuration
 
-The project is still missing or limited in:
+Important gaps before production use still include:
 
-- richer Redis data structures such as lists, hashes, sets, and sorted sets
-- persistence (AOF/RDB)
-- more production hardening like connection quotas and metrics
-- formal benchmark data and tuning results
+- Persistence and recovery guarantees
+- Authentication, transport security, and a safer default bind policy
+- Total database memory quotas, metrics, health checks, and deployment guidance
+- Hashes, sets, sorted sets, and blocking list commands
+
+## Local benchmark
+
+The following is a single local comparison run made on 2026-10-02 with
+`redis-benchmark 7.0.15`. Both servers ran sequentially on the same WSL2 Linux
+host (`12` logical CPUs, Linux kernel `6.18.33.2-microsoft-standard-WSL2`),
+bound to loopback. Each benchmark case sent 10,000 requests using 10 concurrent
+clients, a 16-byte payload, and pipeline depth 1:
+
+```bash
+redis-benchmark -h 127.0.0.1 -p PORT \
+  -n 10000 -c 10 -d 16 -P 1 \
+  -t ping_inline,ping_mbulk,set,get,lpush,rpush,lpop,rpop
+```
+
+| Command | Goroutine server req/s | p50 / p95 / p99 (ms) | Reactor server req/s | p50 / p95 / p99 (ms) |
+|---|---:|---:|---:|---:|
+| PING_INLINE | 28,735.63 | 0.215 / 0.647 / 1.287 | 44,642.86 | 0.143 / 0.391 / 0.799 |
+| PING_MBULK | 25,575.45 | 0.223 / 0.711 / 1.423 | 54,945.05 | 0.119 / 0.359 / 0.679 |
+| SET | 30,120.48 | 0.199 / 0.623 / 1.327 | 52,910.05 | 0.127 / 0.383 / 0.751 |
+| GET | 29,761.90 | 0.207 / 0.631 / 1.367 | 50,505.05 | 0.127 / 0.407 / 0.727 |
+| LPUSH | 30,581.04 | 0.207 / 0.607 / 1.191 | 49,261.09 | 0.135 / 0.423 / 0.751 |
+| RPUSH | 29,154.52 | 0.215 / 0.647 / 1.191 | 47,393.37 | 0.143 / 0.455 / 0.687 |
+| LPOP | 30,120.48 | 0.199 / 0.655 / 1.191 | 52,356.02 | 0.127 / 0.407 / 0.639 |
+| RPOP | 32,573.29 | 0.191 / 0.591 / 1.095 | 51,546.39 | 0.127 / 0.415 / 0.663 |
+
+These figures are a one-off loopback smoke benchmark, not a capacity estimate,
+SLA, or production comparison. Results depend on the host, runtime, and load;
+they were not repeated to calculate confidence intervals or run to saturation.
+The native benchmark covers PING, SET/GET, and list push/pop only; it does not
+measure every implemented list command or unsupported Redis commands. It also
+does not model persistence, TLS, or network latency. `redis-benchmark` printed
+`WARNING: Could not fetch server CONFIG` because Carrot does not implement
+`CONFIG`; the selected benchmark cases still completed.
 
 ---
 
@@ -101,7 +177,7 @@ Carrot was built to explore two concurrency models:
 1. A simple per-client goroutine server for clarity and ease of debugging
 2. A Linux epoll reactor for lower-overhead, event-driven networking
 
-The repo is intentionally built around a small, understandable codebase rather than a large Redis-compatible feature set.
+Carrot is not a drop-in Redis replacement. The project goal, out-of-scope features, readiness phases, and verified test baseline are described in [docs/PROJECT_SCOPE.md](docs/PROJECT_SCOPE.md), [docs/TEST_SUMMARY.md](docs/TEST_SUMMARY.md), and [docs/TEST_EXECUTION_GUIDE.md](docs/TEST_EXECUTION_GUIDE.md).
 
 ---
 

@@ -1,3 +1,4 @@
+// Package command parses client requests and executes the supported command set.
 package command
 
 // Command represents a parsed Redis command.

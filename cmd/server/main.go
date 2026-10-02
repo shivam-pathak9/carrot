@@ -1,21 +1,60 @@
+// Package main starts the goroutine-based server and coordinates signal shutdown.
 package main
 
 import (
+	"context"
+	"flag"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/shivam-pathak9/carrot/internal/config"
 	"github.com/shivam-pathak9/carrot/internal/server"
 )
 
+// main loads flags, starts the TCP server, and shuts it down on SIGINT or SIGTERM.
 func main() {
-	// Entry point for the Carrot server binary.
-	// Loads default configuration, constructs a server and starts it.
-	// configuration loading
 	cfg := config.DefaultConfig()
-	// creating new server
-	srv := server.NewServer(cfg)
+	flag.StringVar(&cfg.Host, "host", cfg.Host, "TCP address to bind")
+	flag.StringVar(&cfg.Port, "port", cfg.Port, "TCP port to bind")
+	flag.IntVar(&cfg.MaxConnections, "max-connections", cfg.MaxConnections, "maximum simultaneous client connections")
+	flag.IntVar(&cfg.MaxRequestBytes, "max-request-bytes", cfg.MaxRequestBytes, "maximum bytes per RESP request")
+	flag.IntVar(&cfg.MaxResponseBytes, "max-response-bytes", cfg.MaxResponseBytes, "maximum bytes per RESP response")
+	flag.DurationVar(&cfg.ReadTimeout, "read-timeout", cfg.ReadTimeout, "client read inactivity timeout")
+	flag.DurationVar(&cfg.WriteTimeout, "write-timeout", cfg.WriteTimeout, "client response write timeout")
+	flag.Parse()
 
-	if err := srv.Start(); err != nil {
-		log.Fatal(err)
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("invalid configuration: %v", err)
+	}
+	if config.IsWildcardHost(cfg.Host) {
+		log.Printf("WARNING: listening on all network interfaces without authentication or TLS")
+	}
+
+	srv := server.NewServer(cfg)
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Start() }()
+
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			log.Fatalf("server stopped: %v", err)
+		}
+	case sig := <-signals:
+		log.Printf("received %s; shutting down", sig)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Printf("shutdown completed with error: %v", err)
+		}
+		if err := <-serveErr; err != nil {
+			log.Fatalf("server stopped: %v", err)
+		}
 	}
 }

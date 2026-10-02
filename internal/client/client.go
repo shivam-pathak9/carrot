@@ -1,3 +1,4 @@
+// Package client adapts a network connection to the RESP decoder and encoder.
 package client
 
 import (
@@ -19,7 +20,13 @@ type Client struct {
 	encoder *resp.Encoder
 }
 
+// NewClient wraps conn with buffered RESP I/O and the default request-size limit.
 func NewClient(conn net.Conn) *Client {
+	return NewClientWithLimit(conn, 2<<20)
+}
+
+// NewClientWithLimit wraps conn and limits the size of each decoded RESP request.
+func NewClientWithLimit(conn net.Conn, maxRequestBytes int) *Client {
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 
@@ -33,7 +40,7 @@ func NewClient(conn net.Conn) *Client {
 		reader: reader,
 		writer: writer,
 
-		decoder: resp.NewDecoder(reader),
+		decoder: resp.NewDecoderWithLimit(reader, maxRequestBytes),
 		encoder: resp.NewEncoder(writer),
 	}
 }
@@ -51,6 +58,7 @@ func (c *Client) Read(p []byte) (int, error) {
 	return c.reader.Read(p)
 }
 
+// Write sends raw bytes and flushes them before returning.
 func (c *Client) Write(p []byte) (int, error) {
 	n, err := c.writer.Write(p)
 	if err != nil {
@@ -100,6 +108,13 @@ func (c *Client) SetReadDeadline(deadline time.Time) error {
 		return nil
 	}
 	return c.conn.SetReadDeadline(deadline)
+}
+
+func (c *Client) SetWriteDeadline(deadline time.Time) error {
+	if c.conn == nil {
+		return nil
+	}
+	return c.conn.SetWriteDeadline(deadline)
 }
 
 func (c *Client) RemoteAddr() net.Addr {

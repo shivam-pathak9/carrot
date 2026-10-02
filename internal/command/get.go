@@ -19,7 +19,10 @@ func handleGet(store *storage.Store, args []string) (resp.Value, error) {
 	}
 
 	key := args[0]
-	val, found := store.Get(key)
+	val, found, err := store.GetString(key)
+	if err != nil {
+		return listError(err), nil
+	}
 	if !found {
 		return resp.NewNullBulkString(), nil
 	}

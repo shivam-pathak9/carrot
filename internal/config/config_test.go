@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -31,6 +32,77 @@ func TestDefaultConfigPort(t *testing.T) {
 
 	if cfg.Port != "6379" {
 		t.Errorf("Expected port '6379', got '%s'", cfg.Port)
+	}
+}
+
+func TestDefaultOperationalConfig(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.MaxConnections != 128 {
+		t.Errorf("MaxConnections = %d, want 128", cfg.MaxConnections)
+	}
+	if cfg.MaxRequestBytes != 2<<20 {
+		t.Errorf("MaxRequestBytes = %d, want %d", cfg.MaxRequestBytes, 2<<20)
+	}
+	if cfg.MaxResponseBytes != 4<<20 {
+		t.Errorf("MaxResponseBytes = %d, want %d", cfg.MaxResponseBytes, 4<<20)
+	}
+	if cfg.ReadTimeout <= 0 || cfg.WriteTimeout <= 0 {
+		t.Errorf("timeouts must be positive: read=%s write=%s", cfg.ReadTimeout, cfg.WriteTimeout)
+	}
+}
+
+func TestConfigValidation(t *testing.T) {
+	valid := DefaultConfig()
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("Validate(default) error = %v", err)
+	}
+	for _, test := range []struct {
+		name string
+		edit func(*Config)
+		want string
+	}{
+		{"empty host", func(c *Config) { c.Host = "" }, "host"},
+		{"invalid host", func(c *Config) { c.Host = "bad host" }, "host"},
+		{"invalid port", func(c *Config) { c.Port = "abc" }, "port"},
+		{"port out of range", func(c *Config) { c.Port = "65536" }, "port"},
+		{"zero connections", func(c *Config) { c.MaxConnections = 0 }, "max connections"},
+		{"negative request limit", func(c *Config) { c.MaxRequestBytes = -1 }, "max request"},
+		{"negative response limit", func(c *Config) { c.MaxResponseBytes = -1 }, "max response"},
+		{"zero read timeout", func(c *Config) { c.ReadTimeout = 0 }, "read timeout"},
+		{"negative write timeout", func(c *Config) { c.WriteTimeout = -1 }, "write timeout"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := valid
+			test.edit(&cfg)
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Validate() error = %v, want message containing %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestConfigWithDefaults(t *testing.T) {
+	cfg := (Config{Host: "127.0.0.1", Port: "16379"}).WithDefaults()
+	if cfg.Host != "127.0.0.1" || cfg.Port != "16379" {
+		t.Fatalf("WithDefaults changed address: %+v", cfg)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate(WithDefaults) error = %v", err)
+	}
+}
+
+func TestIsWildcardHost(t *testing.T) {
+	for host, want := range map[string]bool{
+		"0.0.0.0":   true,
+		"::":        true,
+		"::0":       true,
+		"127.0.0.1": false,
+		"localhost": false,
+	} {
+		if got := IsWildcardHost(host); got != want {
+			t.Errorf("IsWildcardHost(%q) = %t, want %t", host, got, want)
+		}
 	}
 }
 

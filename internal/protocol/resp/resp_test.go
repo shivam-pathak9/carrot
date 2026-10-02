@@ -254,6 +254,22 @@ func TestDecodeRejectsOversizedArray(t *testing.T) {
 	}
 }
 
+func TestDecodeRejectsOversizedAggregateMessage(t *testing.T) {
+	payload := "*2\r\n$3\r\nGET\r\n$8\r\nkey-data\r\n"
+	decoder := NewDecoderWithLimit(bufio.NewReader(strings.NewReader(payload)), 20)
+	if _, err := decoder.Decode(); err == nil || !strings.Contains(err.Error(), "message exceeds") {
+		t.Fatalf("Decode() error = %v, want aggregate request limit error", err)
+	}
+}
+
+func TestDecodeRejectsExcessiveNesting(t *testing.T) {
+	payload := strings.Repeat("*1\r\n", maxRESPDepth+1) + "+x\r\n"
+	decoder := NewDecoder(bufio.NewReader(strings.NewReader(payload)))
+	if _, err := decoder.Decode(); err == nil || !strings.Contains(err.Error(), "nesting exceeds") {
+		t.Fatalf("Decode() error = %v, want nesting limit error", err)
+	}
+}
+
 // TestEncodeSimpleString tests encoding a simple string
 func TestEncodeSimpleString(t *testing.T) {
 	buffer := &bytes.Buffer{}

@@ -1,8 +1,16 @@
+// Package server implements the goroutine-per-client TCP server.
 package server
 
 import (
+	"bufio"
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
 	"log"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/shivam-pathak9/carrot/internal/client"
@@ -12,6 +20,8 @@ import (
 	"github.com/shivam-pathak9/carrot/internal/storage"
 )
 
+// Server owns the listener lifecycle and shares command execution and storage
+// across its client handlers.
 type Server struct {
 	config   config.Config
 	listener net.Listener
@@ -20,66 +30,183 @@ type Server struct {
 	parser   *command.Parser
 	executor *command.Executor
 
-	stopChan chan struct{}
+	mu        sync.Mutex
+	active    map[net.Conn]struct{}
+	closing   bool
+	started   bool
+	stopChan  chan struct{}
+	stopOnce  sync.Once
+	serveDone chan struct{}
+	clientsWg sync.WaitGroup
 }
 
+// NewServer creates a server with fresh in-memory storage and initialized handlers.
 func NewServer(cfg config.Config) *Server {
-	// NewServer constructs a server instance with the provided
-	// configuration, a fresh storage engine, and initial command parser/executor.
+	cfg = cfg.WithDefaults()
 	store := storage.NewStore()
 	return &Server{
-		config:   cfg,
-		store:    store,
-		parser:   command.NewParser(),
-		executor: command.NewExecutor(store),
-		stopChan: make(chan struct{}),
+		config:    cfg,
+		store:     store,
+		parser:    command.NewParser(),
+		executor:  command.NewExecutor(store),
+		active:    make(map[net.Conn]struct{}),
+		stopChan:  make(chan struct{}),
+		serveDone: make(chan struct{}),
 	}
 }
 
+// Start validates configuration, opens a TCP listener, and serves until
+// Shutdown is called or the listener fails.
 func (s *Server) Start() error {
-
-	address := s.config.Host + ":" + s.config.Port
-
+	if err := s.config.Validate(); err != nil {
+		return fmt.Errorf("invalid server configuration: %w", err)
+	}
+	address := net.JoinHostPort(s.config.Host, s.config.Port)
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
-		return err
+		return fmt.Errorf("listen on %s: %w", address, err)
 	}
+	s.mu.Lock()
+	closing := s.closing
+	s.mu.Unlock()
+	if closing {
+		_ = listener.Close()
+		return nil
+	}
+	return s.Serve(listener)
+}
 
+// Addr returns the bound listener address, or nil before the server starts.
+func (s *Server) Addr() net.Addr {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.listener == nil {
+		return nil
+	}
+	return s.listener.Addr()
+}
+
+// Serve runs the server on an existing listener. It is useful for embedding
+// and for tests that need an ephemeral local port.
+func (s *Server) Serve(listener net.Listener) error {
+	if listener == nil {
+		return errors.New("listener must not be nil")
+	}
+	if err := s.config.Validate(); err != nil {
+		return fmt.Errorf("invalid server configuration: %w", err)
+	}
+	s.mu.Lock()
+	if s.started {
+		s.mu.Unlock()
+		_ = listener.Close()
+		return errors.New("server has already been started")
+	}
+	if s.closing {
+		s.mu.Unlock()
+		_ = listener.Close()
+		return nil
+	}
+	s.started = true
 	s.listener = listener
+	s.mu.Unlock()
+	defer func() {
+		_ = listener.Close()
+		s.stopOnce.Do(func() { close(s.stopChan) })
+		close(s.serveDone)
+	}()
 
-	log.Printf("Carrot listening on %s\n", address)
-
-	// Launch background Active Expiration loop for multi-threaded server.
-	// Runs every 100ms in a dedicated background goroutine.
+	log.Printf("Carrot listening on %s", listener.Addr())
 	go s.startActiveExpireLoop()
 
-	// Accept loop: accept connections and start a goroutine to
-	// handle each client independently.
 	for {
-
-		conn, err := s.listener.Accept()
-
+		conn, err := listener.Accept()
 		if err != nil {
-			log.Println(err)
-			continue
+			s.mu.Lock()
+			closing := s.closing
+			s.mu.Unlock()
+			if closing || errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			if temporary, ok := err.(net.Error); ok && temporary.Temporary() {
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			s.mu.Lock()
+			s.closing = true
+			for activeConn := range s.active {
+				_ = activeConn.Close()
+			}
+			s.mu.Unlock()
+			return fmt.Errorf("accept client connection: %w", err)
 		}
 
-		log.Printf("Client Connected: %s\n", conn.RemoteAddr())
-
-		client := client.NewClient(conn)
-		go s.handleClient(client)
-
+		s.mu.Lock()
+		if s.closing {
+			s.mu.Unlock()
+			_ = conn.Close()
+			return nil
+		}
+		if len(s.active) >= s.config.MaxConnections {
+			s.mu.Unlock()
+			log.Printf("rejecting client %s: connection limit reached", conn.RemoteAddr())
+			_ = conn.Close()
+			continue
+		}
+		s.active[conn] = struct{}{}
+		s.clientsWg.Add(1)
+		s.mu.Unlock()
+		go s.handleClient(conn)
 	}
 }
 
-// startActiveExpireLoop runs a periodic cleanup pass for expired keys in the goroutine-based server.
-//
-// This is separate from client request handling so the store can reclaim stale TTL entries even when no
-// client is actively reading or writing them. The loop wakes every 100ms and calls ActiveExpireCycle().
+// Shutdown stops accepting requests and waits for clients to disconnect. If
+// the context expires, active connections are closed so shutdown can finish.
+func (s *Server) Shutdown(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("shutdown context must not be nil")
+	}
+	s.mu.Lock()
+	if !s.started {
+		s.closing = true
+		s.stopOnce.Do(func() { close(s.stopChan) })
+		s.mu.Unlock()
+		return nil
+	}
+	s.closing = true
+	listener := s.listener
+	s.stopOnce.Do(func() { close(s.stopChan) })
+	s.mu.Unlock()
+
+	var closeErr error
+	if listener != nil {
+		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			closeErr = fmt.Errorf("close listener: %w", err)
+		}
+	}
+	<-s.serveDone
+
+	done := make(chan struct{})
+	go func() {
+		s.clientsWg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return closeErr
+	case <-ctx.Done():
+		s.mu.Lock()
+		for conn := range s.active {
+			_ = conn.Close()
+		}
+		s.mu.Unlock()
+		<-done
+		return errors.Join(closeErr, ctx.Err())
+	}
+}
+
 func (s *Server) startActiveExpireLoop() {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ticker.C:
@@ -90,58 +217,86 @@ func (s *Server) startActiveExpireLoop() {
 	}
 }
 
-func (s *Server) handleClient(client *client.Client) {
+// handleClient decodes each request, passes it through parsing and execution,
+// then writes one bounded response before reading the next request.
+func (s *Server) handleClient(conn net.Conn) {
 	defer func() {
-		if err := client.Close(); err != nil {
-			log.Printf("failed to close client connection: %v", err)
-		}
+		_ = conn.Close()
+		s.mu.Lock()
+		delete(s.active, conn)
+		s.mu.Unlock()
+		s.clientsWg.Done()
 	}()
 
-	if err := client.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
-		return
-	}
-
-	// handleClient processes one client connection by repeatedly decoding a RESP request,
-	// parsing it into a command, executing it, and writing the response back over the same socket.
-	// A client disconnect, protocol error, or timeout ends the loop and closes the connection.
+	c := client.NewClientWithLimit(conn, s.config.MaxRequestBytes)
 	for {
-		// 1. Decode RESP request
-		value, err := client.Decoder().Decode()
-		if err != nil {
+		if err := c.SetReadDeadline(time.Now().Add(s.config.ReadTimeout)); err != nil {
+			log.Printf("set read deadline for %s: %v", conn.RemoteAddr(), err)
 			return
 		}
-		if err := client.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		value, err := c.Decoder().Decode()
+		if err != nil {
+			var netErr net.Error
+			if !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.EOF) && !(errors.As(err, &netErr) && netErr.Timeout()) {
+				log.Printf("decode request from %s: %v", conn.RemoteAddr(), err)
+			}
 			return
 		}
 
-		// 2. Parse RESP into a Command
 		cmd, err := s.parser.Parse(value)
 		if err != nil {
-			_ = client.Encoder().Encode(resp.NewError(err.Error()))
-			_ = client.Flush()
+			if err := s.writeResponse(c, resp.NewError(err.Error())); err != nil {
+				log.Printf("write protocol error to %s: %v", conn.RemoteAddr(), err)
+				return
+			}
 			continue
 		}
-
-		// 3. Execute command
 		response, err := s.executor.Execute(cmd)
 		if err != nil {
-			_ = client.Encoder().Encode(resp.NewError(err.Error()))
-			_ = client.Flush()
+			if err := s.writeResponse(c, resp.NewError(err.Error())); err != nil {
+				log.Printf("write command error to %s: %v", conn.RemoteAddr(), err)
+				return
+			}
 			continue
 		}
-
-		// 4. Encode RESP response
-		if err := client.Encoder().Encode(response); err != nil {
-			return
-		}
-
-		// 5. Send it to the client
-		// We call `Flush()` to ensure the buffered encoder output is
-		// transmitted to the remote peer. If Flush fails it usually
-		// indicates the connection has been closed or encounter IO
-		// errors and we should terminate the handler.
-		if err := client.Flush(); err != nil {
+		if err := s.writeResponse(c, response); err != nil {
+			log.Printf("write response to %s: %v", conn.RemoteAddr(), err)
 			return
 		}
 	}
+}
+
+// writeResponse encodes a response within the configured size limit before
+// writing it, so an oversized response is not partially sent to the client.
+func (s *Server) writeResponse(c *client.Client, value resp.Value) error {
+	var output bytes.Buffer
+	writer := bufio.NewWriter(&limitedWriter{writer: &output, limit: s.config.MaxResponseBytes})
+	if err := resp.NewEncoder(writer).Encode(value); err != nil {
+		return fmt.Errorf("encode response: %w", err)
+	}
+	if err := writer.Flush(); err != nil {
+		return fmt.Errorf("response exceeds %d bytes: %w", s.config.MaxResponseBytes, err)
+	}
+	if err := c.SetWriteDeadline(time.Now().Add(s.config.WriteTimeout)); err != nil {
+		return fmt.Errorf("set write deadline: %w", err)
+	}
+	if _, err := c.Write(output.Bytes()); err != nil {
+		return fmt.Errorf("write response: %w", err)
+	}
+	return nil
+}
+
+type limitedWriter struct {
+	writer  io.Writer
+	limit   int
+	written int
+}
+
+func (w *limitedWriter) Write(p []byte) (int, error) {
+	if len(p) > w.limit-w.written {
+		return 0, fmt.Errorf("output limit exceeded")
+	}
+	n, err := w.writer.Write(p)
+	w.written += n
+	return n, err
 }

@@ -1,5 +1,6 @@
 //go:build linux
 
+// connection.go implements each non-blocking client socket's read/execute/write cycle.
 package reactor
 
 import (
@@ -32,8 +33,10 @@ import (
 //     Crucial for non-blocking socket writes when OS TCP socket send buffer is temporarily full.
 //   - isClosed : Guard flag ensuring idempotent close operations and preventing operations on closed FDs.
 const (
-	maxInboundBufferSize = 1 << 20 // 1 MiB cap to prevent unbounded inBuf growth from malicious clients
-	idleTimeout          = 30 * time.Second
+	defaultMaxInboundBufferSize  = 2 << 20
+	defaultMaxOutboundBufferSize = 4 << 20
+	defaultIdleTimeout           = 30 * time.Second
+	defaultWriteTimeout          = 10 * time.Second
 )
 
 type Connection struct {
@@ -45,6 +48,11 @@ type Connection struct {
 	inBuf        bytes.Buffer // Inbound stream buffer (accumulates partial TCP frames)
 	outBuf       bytes.Buffer // Outbound stream buffer (queues pending socket writes)
 	lastActivity time.Time    // Tracks last successful read/write activity for idle disconnects
+	writeStarted time.Time
+	maxInbound   int
+	maxOutbound  int
+	idleTimeout  time.Duration
+	writeTimeout time.Duration
 
 	isClosed bool // Closed status safety flag
 }
@@ -57,13 +65,29 @@ type Connection struct {
 //   - parser  : Reference to command parser.
 //   - executor: Reference to command executor.
 func NewConnection(fd int, poller *Poller, parser *command.Parser, executor *command.Executor) *Connection {
+	return NewConnectionWithLimits(fd, poller, parser, executor, defaultMaxInboundBufferSize, defaultMaxOutboundBufferSize, defaultIdleTimeout, defaultWriteTimeout)
+}
+
+// NewConnectionWithLimits wraps fd with explicit inbound/outbound and timeout bounds.
+func NewConnectionWithLimits(fd int, poller *Poller, parser *command.Parser, executor *command.Executor, maxInbound, maxOutbound int, idleTimeout, writeTimeout time.Duration) *Connection {
 	return &Connection{
 		fd:           fd,
 		poller:       poller,
 		parser:       parser,
 		executor:     executor,
 		lastActivity: time.Now(),
+		maxInbound:   maxInbound,
+		maxOutbound:  maxOutbound,
+		idleTimeout:  idleTimeout,
+		writeTimeout: writeTimeout,
 	}
+}
+
+func (c *Connection) expired(now time.Time) bool {
+	if now.Sub(c.lastActivity) >= c.idleTimeout {
+		return true
+	}
+	return c.outBuf.Len() > 0 && now.Sub(c.writeStarted) >= c.writeTimeout
 }
 
 // FD returns the underlying numeric OS socket file descriptor.
@@ -80,7 +104,7 @@ func (c *Connection) OnRead() error {
 	if c.isClosed {
 		return errors.New("connection closed")
 	}
-	if time.Since(c.lastActivity) > idleTimeout {
+	if time.Since(c.lastActivity) >= c.idleTimeout {
 		return fmt.Errorf("idle timeout")
 	}
 
@@ -90,11 +114,14 @@ func (c *Connection) OnRead() error {
 		// unix.Read performs raw, non-blocking read system call on socket file descriptor (c.fd)
 		n, err := unix.Read(c.fd, buf)
 		if n > 0 {
-			if c.inBuf.Len()+n > maxInboundBufferSize {
+			if n > c.maxInbound-c.inBuf.Len() {
 				return fmt.Errorf("input buffer limit exceeded on fd %d", c.fd)
 			}
 			c.inBuf.Write(buf[:n]) // Append read bytes into inBuf
 			c.lastActivity = time.Now()
+			if err := c.processCommands(); err != nil {
+				return err
+			}
 		}
 
 		if err != nil {
@@ -128,10 +155,10 @@ func (c *Connection) OnRead() error {
 // are processed in order without skipping data.
 func (c *Connection) processCommands() error {
 	for c.inBuf.Len() > 0 {
-		raw := c.inBuf.Bytes()                // Inspect current byte slice snapshot in inBuf
-		reader := bytes.NewReader(raw)        // Create reader over snapshot
-		bufReader := bufio.NewReader(reader)  // Wrap in bufio.Reader required by RESP Decoder
-		decoder := resp.NewDecoder(bufReader) // Instantiate RESP protocol decoder
+		raw := c.inBuf.Bytes()               // Inspect current byte slice snapshot in inBuf
+		reader := bytes.NewReader(raw)       // Create reader over snapshot
+		bufReader := bufio.NewReader(reader) // Wrap in bufio.Reader required by RESP Decoder
+		decoder := resp.NewDecoderWithLimit(bufReader, c.maxInbound)
 
 		// Attempt to decode next RESP Value
 		value, err := decoder.Decode()
@@ -144,7 +171,9 @@ func (c *Connection) processCommands() error {
 
 			// Malformed protocol error: send RESP Error response and reset input buffer
 			respErr := resp.NewError(fmt.Sprintf("ERR protocol error: %v", err))
-			c.writeResponse(respErr)
+			if writeErr := c.writeResponse(respErr); writeErr != nil {
+				return writeErr
+			}
 			c.inBuf.Reset()
 			return c.Flush()
 		}
@@ -168,7 +197,9 @@ func (c *Connection) processCommands() error {
 		cmd, err := c.parser.Parse(value)
 		if err != nil {
 			respErr := resp.NewError(err.Error())
-			c.writeResponse(respErr)
+			if writeErr := c.writeResponse(respErr); writeErr != nil {
+				return writeErr
+			}
 			continue
 		}
 
@@ -176,12 +207,16 @@ func (c *Connection) processCommands() error {
 		response, err := c.executor.Execute(cmd)
 		if err != nil {
 			respErr := resp.NewError(err.Error())
-			c.writeResponse(respErr)
+			if writeErr := c.writeResponse(respErr); writeErr != nil {
+				return writeErr
+			}
 			continue
 		}
 
-		// Step 3: Serialize response Value into outbound buffer outBuf
-		c.writeResponse(response)
+		// Step 3: Serialize response Value into bounded outbound buffer outBuf
+		if err := c.writeResponse(response); err != nil {
+			return err
+		}
 	}
 
 	// Attempt to flush queued outbound response bytes to non-blocking socket
@@ -189,15 +224,34 @@ func (c *Connection) processCommands() error {
 }
 
 // writeResponse serializes a RESP Value (e.g., SimpleString "+PONG\r\n") into outBuf.
-func (c *Connection) writeResponse(val resp.Value) {
+func (c *Connection) writeResponse(val resp.Value) error {
 	var buf bytes.Buffer
-	writer := bufio.NewWriter(&buf)
+	writer := bufio.NewWriter(&limitedBuffer{buffer: &buf, limit: c.maxOutbound - c.outBuf.Len()})
 	encoder := resp.NewEncoder(writer)
 
-	if err := encoder.Encode(val); err == nil {
-		_ = writer.Flush()
-		c.outBuf.Write(buf.Bytes()) // Queue serialized bytes into outBuf for transmission
+	if err := encoder.Encode(val); err != nil {
+		return fmt.Errorf("encode response: %w", err)
 	}
+	if err := writer.Flush(); err != nil {
+		return fmt.Errorf("response buffer limit exceeded: %w", err)
+	}
+	if c.outBuf.Len() == 0 {
+		c.writeStarted = time.Now()
+	}
+	_, err := c.outBuf.Write(buf.Bytes())
+	return err
+}
+
+type limitedBuffer struct {
+	buffer *bytes.Buffer
+	limit  int
+}
+
+func (w *limitedBuffer) Write(p []byte) (int, error) {
+	if len(p) > w.limit {
+		return 0, fmt.Errorf("output limit exceeded")
+	}
+	return w.buffer.Write(p)
 }
 
 // Flush sends any queued response bytes to the client socket.
@@ -229,9 +283,13 @@ func (c *Connection) Flush() error {
 			// Fatal socket write error
 			return fmt.Errorf("write error on fd %d: %w", c.fd, err)
 		}
+		if n == 0 {
+			return fmt.Errorf("write made no progress on fd %d", c.fd)
+		}
 	}
 
 	// All queued bytes in outBuf successfully sent!
+	c.writeStarted = time.Time{}
 	// Reset interest mask back to default (disabling EPOLLOUT to prevent unnecessary CPU wakeups)
 	return c.poller.Modify(c.fd, DefaultEventMask)
 }

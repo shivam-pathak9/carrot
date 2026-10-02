@@ -10,6 +10,7 @@ const (
 	maxRESPLineLength   = 16 * 1024
 	maxBulkStringLength = 1 << 20
 	maxArrayLength      = 1024
+	maxRESPDepth        = 64
 )
 
 func (d *Decoder) readLine() (string, error) {
@@ -20,6 +21,9 @@ func (d *Decoder) readLine() (string, error) {
 	for {
 		chunk, err := d.reader.ReadSlice('\n')
 		if len(chunk) > 0 {
+			if budgetErr := d.consume(len(chunk)); budgetErr != nil {
+				return "", budgetErr
+			}
 			line = append(line, chunk...)
 			if len(line) > maxRESPLineLength {
 				return "", fmt.Errorf("RESP line exceeds %d bytes", maxRESPLineLength)
@@ -45,6 +49,14 @@ func (d *Decoder) readLine() (string, error) {
 	return string(line[:n-2]), nil
 }
 
+func (d *Decoder) consume(n int) error {
+	if n < 0 || d.messageBytes > d.maxMessageBytes-n {
+		return fmt.Errorf("RESP message exceeds max allowed %d bytes", d.maxMessageBytes)
+	}
+	d.messageBytes += n
+	return nil
+}
+
 func (d *Decoder) expectCRLF() error {
 	// expectCRLF consumes the next two bytes and verifies they are
 	// CR and LF. It is used after reading fixed-length payloads
@@ -56,9 +68,15 @@ func (d *Decoder) expectCRLF() error {
 	if err != nil {
 		return err
 	}
+	if err := d.consume(1); err != nil {
+		return err
+	}
 
 	lf, err := d.reader.ReadByte()
 	if err != nil {
+		return err
+	}
+	if err := d.consume(1); err != nil {
 		return err
 	}
 

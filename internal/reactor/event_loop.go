@@ -1,5 +1,6 @@
 //go:build linux
 
+// event_loop.go accepts sockets and dispatches epoll readiness to connections.
 package reactor
 
 import (
@@ -8,8 +9,10 @@ import (
 	"io"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/shivam-pathak9/carrot/internal/command"
+	"github.com/shivam-pathak9/carrot/internal/config"
 	"github.com/shivam-pathak9/carrot/internal/storage"
 	"golang.org/x/sys/unix"
 )
@@ -35,23 +38,30 @@ type EventLoop struct {
 	executor   *command.Executor // Shared command executor handle
 	store      *storage.Store    // Shared storage engine handle for active expiration
 
-	conns map[int]*Connection // O(1) lookup table mapping socket FD -> Connection struct
+	config config.Config
+	conns  map[int]*Connection // O(1) lookup table mapping socket FD -> Connection struct
 
 	stopChan chan struct{} // Signal channel for loop termination
 	mu       sync.Mutex    // State mutex for thread safety
 	running  bool          // Active execution flag
 }
 
-// NewEventLoop constructs a new EventLoop instance.
+// NewEventLoop constructs an event loop with default server settings.
 func NewEventLoop(poller *Poller, listenerFD int, parser *command.Parser, executor *command.Executor, store *storage.Store) *EventLoop {
+	return NewEventLoopWithConfig(poller, listenerFD, parser, executor, store, config.DefaultConfig(), make(chan struct{}))
+}
+
+// NewEventLoopWithConfig constructs an event loop using the supplied limits and stop signal.
+func NewEventLoopWithConfig(poller *Poller, listenerFD int, parser *command.Parser, executor *command.Executor, store *storage.Store, cfg config.Config, stopChan chan struct{}) *EventLoop {
 	return &EventLoop{
 		poller:     poller,
 		listenerFD: listenerFD,
 		parser:     parser,
 		executor:   executor,
 		store:      store,
+		config:     cfg.WithDefaults(),
 		conns:      make(map[int]*Connection),
-		stopChan:   make(chan struct{}),
+		stopChan:   stopChan,
 	}
 }
 
@@ -84,6 +94,7 @@ func NewEventLoop(poller *Poller, listenerFD int, parser *command.Parser, execut
 //    preventing socket buffer overflows.
 
 func (el *EventLoop) Run() error {
+	defer el.cleanup()
 	el.mu.Lock()
 	el.running = true
 	el.mu.Unlock()
@@ -101,7 +112,6 @@ func (el *EventLoop) Run() error {
 		select {
 		case <-el.stopChan:
 			log.Println("Stopping reactor event loop...")
-			el.cleanup()
 			return nil
 		default:
 		}
@@ -119,6 +129,11 @@ func (el *EventLoop) Run() error {
 
 		// Dispatch ready file descriptors
 		for _, ev := range events {
+			select {
+			case <-el.stopChan:
+				return nil
+			default:
+			}
 			// Check if event occurred on server listener socket FD
 			if ev.FD == el.listenerFD {
 				el.handleAccept() // Incoming client connection ready to accept
@@ -131,6 +146,7 @@ func (el *EventLoop) Run() error {
 		if el.store != nil {
 			el.store.ActiveExpireCycle()
 		}
+		el.expireConnections()
 	}
 }
 
@@ -160,7 +176,20 @@ func (el *EventLoop) handleAccept() {
 		}
 
 		// Step 1: Create Connection object wrapping newly accepted client file descriptor (nfd)
-		conn := NewConnection(nfd, el.poller, el.parser, el.executor)
+		if len(el.conns) >= el.config.MaxConnections {
+			_ = unix.Close(nfd)
+			continue
+		}
+		conn := NewConnectionWithLimits(
+			nfd,
+			el.poller,
+			el.parser,
+			el.executor,
+			el.config.MaxRequestBytes,
+			el.config.MaxResponseBytes,
+			el.config.ReadTimeout,
+			el.config.WriteTimeout,
+		)
 		el.conns[nfd] = conn // Register in map registry: conns[nfd] = conn
 
 		// Step 2: Register nfd with Linux epoll poller for read readiness (DefaultEventMask)
@@ -238,7 +267,17 @@ func (el *EventLoop) cleanup() {
 		conn.Close()
 		delete(el.conns, fd)
 	}
+	_ = unix.Close(el.listenerFD)
 	el.poller.Close()
+}
+
+func (el *EventLoop) expireConnections() {
+	now := time.Now()
+	for fd, conn := range el.conns {
+		if conn.expired(now) {
+			el.closeClient(fd)
+		}
+	}
 }
 
 // Stop signals the event loop to stop and close all connections cleanly.
@@ -246,6 +285,10 @@ func (el *EventLoop) Stop() {
 	el.mu.Lock()
 	defer el.mu.Unlock()
 	if el.running {
-		close(el.stopChan)
+		select {
+		case <-el.stopChan:
+		default:
+			close(el.stopChan)
+		}
 	}
 }

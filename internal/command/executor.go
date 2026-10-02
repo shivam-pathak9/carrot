@@ -1,3 +1,4 @@
+// executor.go dispatches parsed commands to their implementations.
 package command
 
 import (
@@ -21,7 +22,9 @@ func NewExecutor(store *storage.Store) *Executor {
 	}
 }
 
-// Execute runs the given Command and returns a RESP Value representing the response.
+// Execute runs a parsed command and returns its RESP response. Command-level
+// errors are represented as RESP error values; the Go error is reserved for
+// failures that prevent command execution.
 func (e *Executor) Execute(cmd Command) (resp.Value, error) {
 	switch cmd.Name {
 
@@ -49,6 +52,11 @@ func (e *Executor) Execute(cmd Command) (resp.Value, error) {
 
 	case "EXPIRE":
 		return handleExpire(e.store, cmd.Args)
+
+	case "LPUSH", "RPUSH", "LPUSHX", "RPUSHX",
+		"LPOP", "RPOP", "LLEN", "LRANGE", "LINDEX", "LSET", "LTRIM",
+		"LREM", "LINSERT", "LMOVE", "RPOPLPUSH", "LPOS":
+		return handleListCommand(cmd.Name, e.store, cmd.Args)
 
 	default:
 		return resp.NewError(

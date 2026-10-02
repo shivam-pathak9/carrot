@@ -1,3 +1,4 @@
+// decoder.go handles bounded RESP framing, including nested arrays and inline commands.
 package resp
 
 import (
@@ -6,19 +7,39 @@ import (
 	"strings"
 )
 
+// Decoder reads one RESP value at a time while enforcing message and nesting limits.
 type Decoder struct {
-	reader *bufio.Reader
+	reader          *bufio.Reader
+	maxMessageBytes int
+	messageBytes    int
+	depth           int
 }
 
+// NewDecoder creates a decoder with the default maximum message size.
 func NewDecoder(reader *bufio.Reader) *Decoder {
-	// NewDecoder creates a RESP decoder that reads values from
-	// the provided buffered reader.
+	return NewDecoderWithLimit(reader, 2<<20)
+}
+
+// NewDecoderWithLimit creates a decoder with a per-message byte limit.
+func NewDecoderWithLimit(reader *bufio.Reader, maxMessageBytes int) *Decoder {
 	return &Decoder{
-		reader: reader,
+		reader:          reader,
+		maxMessageBytes: maxMessageBytes,
 	}
 }
 
+// Decode reads one RESP value. Array elements are decoded recursively and count
+// toward the same message-size and nesting-depth limits.
 func (d *Decoder) Decode() (Value, error) {
+	if d.depth == 0 {
+		d.messageBytes = 0
+	}
+	d.depth++
+	defer func() { d.depth-- }()
+	if d.depth > maxRESPDepth {
+		return Value{}, fmt.Errorf("RESP nesting exceeds max allowed %d", maxRESPDepth)
+	}
+
 	// Decode reads the next RESP value from the underlying reader
 	// by inspecting the leading type byte and dispatching to the
 	// appropriate helper. It returns a typed Value on success.
@@ -41,6 +62,9 @@ func (d *Decoder) Decode() (Value, error) {
 	//   is not a known RESP prefix and fall back to decodeInline().
 	prefix, err := d.reader.ReadByte()
 	if err != nil {
+		return Value{}, err
+	}
+	if err := d.consume(1); err != nil {
 		return Value{}, err
 	}
 
@@ -68,6 +92,7 @@ func (d *Decoder) Decode() (Value, error) {
 		if err := d.reader.UnreadByte(); err != nil {
 			return Value{}, fmt.Errorf("failed to unread byte: %w", err)
 		}
+		d.messageBytes--
 		return d.decodeInline()
 	}
 }

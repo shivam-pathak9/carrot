@@ -1,3 +1,4 @@
+// encode.go serializes RESP values; flushing remains the caller's responsibility.
 package resp
 
 import (
@@ -9,6 +10,7 @@ type Encoder struct {
 	writer *bufio.Writer
 }
 
+// NewEncoder creates an encoder that writes to writer without flushing it.
 func NewEncoder(writer *bufio.Writer) *Encoder {
 	// NewEncoder returns a RESP encoder that writes encoded
 	// RESP values to the provided buffered writer.
@@ -17,6 +19,7 @@ func NewEncoder(writer *bufio.Writer) *Encoder {
 	}
 }
 
+// Encode writes v in RESP wire format. Callers control when buffered bytes flush.
 func (e *Encoder) Encode(v Value) error {
 	// Encode writes the provided `Value` to the underlying writer
 	// using the appropriate RESP encoding. It does not flush the

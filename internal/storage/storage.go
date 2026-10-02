@@ -1,3 +1,4 @@
+// Package storage provides synchronized in-memory values and expiration handling.
 package storage
 
 import (
@@ -6,21 +7,29 @@ import (
 	"time"
 )
 
-// Obj represents an entry stored inside the in-memory storage engine.
-//
-// Struct Fields:
-//   - Value    : The string payload associated with the key.
-//   - ExpiresAt: Expiration timestamp. A zero value (time.Time{}) indicates the key does not expire (persistent key).
+// Obj represents a typed entry stored inside the in-memory storage engine.
 type Obj struct {
 	Value     string
 	ExpiresAt time.Time
+	Kind      ValueKind
+	list      listValue
 }
 
-// Store is the in-memory key-value database used by Carrot.
+// ValueKind identifies the Redis-style value type stored at a key.
+type ValueKind uint8
+
+const (
+	StringKind ValueKind = iota
+	ListKind
+)
+
+// Store is the in-memory typed key-value database used by Carrot.
 //
 // It keeps a single Go map guarded by a mutex. This is intentionally simple and safe for the
 // current server design: all store access is synchronized, and the reactor path may also trigger
 // background expiration sweeps while client handlers are running.
+// Store is the shared, mutex-protected database used by command executors.
+// Values are typed so a command can reject operations against the wrong kind.
 type Store struct {
 	mu   sync.RWMutex
 	data map[string]Obj
@@ -57,21 +66,8 @@ func (s *Store) Set(key string, value string, ttl time.Duration) {
 // Expired keys are removed lazily on access, which matches the common Redis pattern for
 // passive expiration handling.
 func (s *Store) Get(key string) (string, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	obj, exists := s.data[key]
-	if !exists {
-		return "", false
-	}
-
-	// Check passive expiration
-	if !obj.ExpiresAt.IsZero() && time.Now().After(obj.ExpiresAt) {
-		delete(s.data, key) // Passive deletion
-		return "", false
-	}
-
-	return obj.Value, true
+	value, exists, err := s.GetString(key)
+	return value, exists && err == nil
 }
 
 // TTL returns the remaining lifetime of key in seconds using Redis-style semantics.

@@ -1,21 +1,57 @@
 //go:build linux
 
+// Package main starts the Linux epoll server and coordinates signal shutdown.
 package main
 
 import (
+	"flag"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/shivam-pathak9/carrot/internal/config"
 	"github.com/shivam-pathak9/carrot/internal/reactor"
 )
 
+// main loads flags, starts the epoll server, and stops it on SIGINT or SIGTERM.
 func main() {
 	// Entry point for the Carrot Reactor server binary.
 	// Uses single-threaded epoll I/O multiplexing event loop.
 	cfg := config.DefaultConfig()
-	srv := reactor.NewServer(cfg)
+	flag.StringVar(&cfg.Host, "host", cfg.Host, "TCP address to bind")
+	flag.StringVar(&cfg.Port, "port", cfg.Port, "TCP port to bind")
+	flag.IntVar(&cfg.MaxConnections, "max-connections", cfg.MaxConnections, "maximum simultaneous client connections")
+	flag.IntVar(&cfg.MaxRequestBytes, "max-request-bytes", cfg.MaxRequestBytes, "maximum bytes per RESP request")
+	flag.IntVar(&cfg.MaxResponseBytes, "max-response-bytes", cfg.MaxResponseBytes, "maximum bytes per RESP response")
+	flag.DurationVar(&cfg.ReadTimeout, "read-timeout", cfg.ReadTimeout, "client read inactivity timeout")
+	flag.DurationVar(&cfg.WriteTimeout, "write-timeout", cfg.WriteTimeout, "client response write timeout")
+	flag.Parse()
 
-	if err := srv.Start(); err != nil {
-		log.Fatalf("Reactor server error: %v", err)
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("invalid configuration: %v", err)
+	}
+	if config.IsWildcardHost(cfg.Host) {
+		log.Printf("WARNING: listening on all network interfaces without authentication or TLS")
+	}
+
+	srv := reactor.NewServer(cfg)
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Start() }()
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			log.Fatalf("Reactor server error: %v", err)
+		}
+	case sig := <-signals:
+		log.Printf("received %s; shutting down", sig)
+		srv.Stop()
+		if err := <-serveErr; err != nil {
+			log.Fatalf("Reactor server error: %v", err)
+		}
 	}
 }
