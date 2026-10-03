@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/shivam-pathak9/carrot/internal/aof"
 	"github.com/shivam-pathak9/carrot/internal/client"
 	"github.com/shivam-pathak9/carrot/internal/command"
 	"github.com/shivam-pathak9/carrot/internal/config"
@@ -29,15 +30,18 @@ type Server struct {
 	store    *storage.Store
 	parser   *command.Parser
 	executor *command.Executor
+	aof      *aof.Log
+	aofMu    sync.Mutex
 
-	mu        sync.Mutex
-	active    map[net.Conn]struct{}
-	closing   bool
-	started   bool
-	stopChan  chan struct{}
-	stopOnce  sync.Once
-	serveDone chan struct{}
-	clientsWg sync.WaitGroup
+	mu                sync.Mutex
+	active            map[net.Conn]struct{}
+	closing           bool
+	started           bool
+	shutdownRequested bool
+	stopChan          chan struct{}
+	stopOnce          sync.Once
+	serveDone         chan struct{}
+	clientsWg         sync.WaitGroup
 }
 
 // NewServer creates a server with fresh in-memory storage and initialized handlers.
@@ -61,19 +65,41 @@ func (s *Server) Start() error {
 	if err := s.config.Validate(); err != nil {
 		return fmt.Errorf("invalid server configuration: %w", err)
 	}
-	address := net.JoinHostPort(s.config.Host, s.config.Port)
-	listener, err := net.Listen("tcp", address)
-	if err != nil {
-		return fmt.Errorf("listen on %s: %w", address, err)
-	}
 	s.mu.Lock()
 	closing := s.closing
 	s.mu.Unlock()
 	if closing {
-		_ = listener.Close()
 		return nil
 	}
-	return s.Serve(listener)
+	if err := s.openPersistence(); err != nil {
+		return err
+	}
+	address := net.JoinHostPort(s.config.Host, s.config.Port)
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return errors.Join(fmt.Errorf("listen on %s: %w", address, err), s.closePersistence())
+	}
+	s.mu.Lock()
+	closing = s.closing
+	s.mu.Unlock()
+	if closing {
+		_ = listener.Close()
+		return s.closePersistence()
+	}
+	serveErr := s.Serve(listener)
+	s.mu.Lock()
+	shutdownRequested := s.shutdownRequested
+	if !shutdownRequested {
+		for conn := range s.active {
+			_ = conn.Close()
+		}
+	}
+	s.mu.Unlock()
+	if shutdownRequested {
+		return serveErr
+	}
+	s.clientsWg.Wait()
+	return errors.Join(serveErr, s.closePersistence())
 }
 
 // Addr returns the bound listener address, or nil before the server starts.
@@ -94,6 +120,9 @@ func (s *Server) Serve(listener net.Listener) error {
 	}
 	if err := s.config.Validate(); err != nil {
 		return fmt.Errorf("invalid server configuration: %w", err)
+	}
+	if err := s.openPersistence(); err != nil {
+		return err
 	}
 	s.mu.Lock()
 	if s.started {
@@ -166,11 +195,12 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		return errors.New("shutdown context must not be nil")
 	}
 	s.mu.Lock()
+	s.shutdownRequested = true
 	if !s.started {
 		s.closing = true
 		s.stopOnce.Do(func() { close(s.stopChan) })
 		s.mu.Unlock()
-		return nil
+		return s.closePersistence()
 	}
 	s.closing = true
 	listener := s.listener
@@ -192,7 +222,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}()
 	select {
 	case <-done:
-		return closeErr
+		return errors.Join(closeErr, s.closePersistence())
 	case <-ctx.Done():
 		s.mu.Lock()
 		for conn := range s.active {
@@ -200,8 +230,42 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		}
 		s.mu.Unlock()
 		<-done
-		return errors.Join(closeErr, ctx.Err())
+		return errors.Join(closeErr, ctx.Err(), s.closePersistence())
 	}
+}
+
+// openPersistence recovers the AOF before clients can execute commands, then
+// installs it as the executor's write-ahead journal.
+func (s *Server) openPersistence() error {
+	if !s.config.AOFEnabled {
+		return nil
+	}
+	s.aofMu.Lock()
+	defer s.aofMu.Unlock()
+	if s.aof != nil {
+		return nil
+	}
+	logFile, err := aof.Open(s.config.AOFPath, s.config.AOFSyncPolicy, s.store)
+	if err != nil {
+		return err
+	}
+	s.aof = logFile
+	s.executor.SetJournal(logFile)
+	return nil
+}
+
+// closePersistence removes the journal from the executor and closes the AOF.
+// It is safe to call when AOF is disabled or was never successfully opened.
+func (s *Server) closePersistence() error {
+	s.aofMu.Lock()
+	defer s.aofMu.Unlock()
+	if s.aof == nil {
+		return nil
+	}
+	err := s.aof.Close()
+	s.aof = nil
+	s.executor.SetJournal(nil)
+	return err
 }
 
 func (s *Server) startActiveExpireLoop() {

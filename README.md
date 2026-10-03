@@ -43,11 +43,12 @@ Carrot currently includes:
 The server currently supports this Redis-inspired command subset:
 
 - `PING`
-- `SET key value [EX seconds|PX milliseconds]`
+- `SET key value [EX seconds|PX milliseconds|PXAT unix-milliseconds]`
 - `GET key`
 - `DEL key [key ...]`
 - `TTL key`
 - `EXPIRE key seconds`
+- `PEXPIREAT key unix-milliseconds`
 
 List commands currently supported:
 
@@ -96,6 +97,55 @@ go run ./cmd/server \
   -read-timeout 30s -write-timeout 10s
 ```
 
+AOF persistence is currently supported on Linux and is enabled by default
+(`appendonly.aof`, `everysec` sync). On other operating systems, builds remain
+available but startup with AOF enabled returns an explicit unsupported-platform
+error; disable AOF only for intentionally ephemeral runs.
+The sync policy can be set to `always`, `everysec`, or `no`; see
+[docs/AOF_PERSISTENCE.md](docs/AOF_PERSISTENCE.md) for the durability contract,
+recovery behavior, and limitations. For a different path or stronger
+write-by-write syncing:
+
+```bash
+go run ./cmd/server -aof-file ./data/carrot.aof -aof-sync always
+```
+
+On a running server, compact the AOF from the current live data with:
+
+```bash
+redis-cli -h 127.0.0.1 -p 6379 AOFREWRITE
+```
+
+This initial rewrite is synchronous: writes pause until the temporary AOF is
+synced and atomically installed; reads continue. The server appends waiting
+writes to the replacement afterward.
+
+### AOF rewrite smoke test
+
+On 2026-10-03, `redis-cli` was used to verify `AOFREWRITE` on both the standard
+server and the event-loop server on Linux. Each test used `always` sync,
+repeatedly overwrote one key to create obsolete history, kept a string and
+list, deleted another key, then rewrote the AOF:
+
+| Server | AOF size before rewrite | After rewrite | Restart check |
+|---|---:|---:|---|
+| Standard | 4,360 bytes | 205 bytes | Passed |
+| Event-loop reactor | 4,360 bytes | 205 bytes | Passed |
+
+For both servers, the current string/list values and latest overwritten value
+were present after rewrite; the deleted key remained absent. A write issued
+after rewrite also survived a forced process stop and restart using the same
+AOF. This is a manual smoke test, not a performance benchmark or a power-loss
+test; it does not establish durability against OS or hardware failure. See
+[docs/AOF_PERSISTENCE.md](docs/AOF_PERSISTENCE.md) for rewrite behavior and
+remaining persistence limitations.
+
+The parent directory must already exist. For an explicitly ephemeral run:
+
+```bash
+go run ./cmd/server -aof-enabled=false
+```
+
 Both binaries handle `SIGINT` and `SIGTERM` for shutdown. The standard server
 stops accepting connections and waits for active clients, closing them if its
 10-second shutdown window expires. The reactor closes its clients and epoll
@@ -118,7 +168,12 @@ Server and reactor TCP integration tests run as part of `go test ./...`.
 
 ## Current status
 
-Carrot is an MVP and is **not production-ready**. It has no persistence or recovery; stored data is lost on process exit. It also has no authentication or transport encryption, and the default bind address is `0.0.0.0`. Use loopback for local testing and do not expose it to untrusted networks.
+Carrot is an MVP and is **not production-ready**. AOF persistence, restart
+recovery, and manual rewrite/compaction are implemented, but broader
+crash/failure validation and backup procedures are still outstanding.
+Durability depends on the configured sync policy. It also has no authentication
+or transport encryption, and the default bind address is `0.0.0.0`. Use
+loopback for local testing and do not expose it to untrusted networks.
 
 The project currently demonstrates:
 
@@ -129,7 +184,7 @@ The project currently demonstrates:
 
 Important gaps before production use still include:
 
-- Persistence and recovery guarantees
+- Crash/fault-injection validation and backup procedures
 - Authentication, transport security, and a safer default bind policy
 - Total database memory quotas, metrics, health checks, and deployment guidance
 - Hashes, sets, sorted sets, and blocking list commands

@@ -2,6 +2,7 @@ package command
 
 import (
 	"strconv"
+	"time"
 
 	"github.com/shivam-pathak9/carrot/internal/protocol/resp"
 	"github.com/shivam-pathak9/carrot/internal/storage"
@@ -25,7 +26,7 @@ func handleExpire(store *storage.Store, args []string) (resp.Value, error) {
 
 	key := args[0]
 	seconds, err := strconv.ParseInt(args[1], 10, 64)
-	if err != nil {
+	if err != nil || seconds > int64((1<<63-1)/int64(time.Second)) {
 		return resp.NewError("ERR value is not an integer or out of range"), nil
 	}
 
@@ -36,5 +37,19 @@ func handleExpire(store *storage.Store, args []string) (resp.Value, error) {
 	}
 
 	// Timeout was set successfully (or key deleted for <= 0 seconds)
+	return resp.NewInteger(1), nil
+}
+
+func handleExpireAt(store *storage.Store, args []string) (resp.Value, error) {
+	if len(args) != 2 {
+		return resp.NewError("ERR wrong number of arguments for 'pexpireat' command"), nil
+	}
+	milliseconds, err := strconv.ParseInt(args[1], 10, 64)
+	if err != nil {
+		return resp.NewError("ERR value is not an integer or out of range"), nil
+	}
+	if !store.ExpireAt(args[0], time.UnixMilli(milliseconds)) {
+		return resp.NewInteger(0), nil
+	}
 	return resp.NewInteger(1), nil
 }

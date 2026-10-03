@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"net"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -15,6 +16,9 @@ import (
 
 func startTestReactor(t *testing.T, cfg config.Config) (*Server, <-chan error) {
 	t.Helper()
+	if cfg.AOFEnabled && (cfg.AOFPath == "" || cfg.AOFPath == "appendonly.aof") {
+		cfg.AOFPath = filepath.Join(t.TempDir(), "appendonly.aof")
+	}
 	srv := NewServer(cfg)
 	result := make(chan error, 1)
 	done := make(chan struct{})
@@ -199,9 +203,63 @@ func TestReactorIPv6Binding(t *testing.T) {
 		t.Skipf("IPv6 loopback dial failed (system may lack IPv6): %v", err)
 		return
 	}
+
 	defer conn.Close()
 
 	if got := reactorCommand(t, conn, "PING"); got.Type != resp.SimpleString || got.String != "PONG" {
 		t.Fatalf("PING response over IPv6 = %+v", got)
+	}
+}
+
+func TestReactorRecoversAOFBeforeAcceptingClients(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Host = "127.0.0.1"
+	cfg.Port = "0"
+	cfg.AOFSyncPolicy = "always"
+	cfg.AOFPath = filepath.Join(t.TempDir(), "restart.aof")
+
+	first, firstResult := startTestReactor(t, cfg)
+	conn, err := net.Dial("tcp", first.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reactorCommand(t, conn, "SET", "durable", "value"); got.Type != resp.SimpleString {
+		t.Fatalf("SET response = %+v", got)
+	}
+	if got := reactorCommand(t, conn, "RPUSH", "queue", "one", "two"); got.Type != resp.Integer {
+		t.Fatalf("RPUSH response = %+v", got)
+	}
+	if got := reactorCommand(t, conn, "AOFREWRITE"); got.Type != resp.SimpleString || got.String != "OK" {
+		t.Fatalf("AOFREWRITE response = %+v", got)
+	}
+	if got := reactorCommand(t, conn, "SET", "after-rewrite", "also-durable"); got.Type != resp.SimpleString {
+		t.Fatalf("SET after AOFREWRITE response = %+v", got)
+	}
+	_ = conn.Close()
+	first.Stop()
+	select {
+	case err := <-firstResult:
+		if err != nil {
+			t.Fatalf("first reactor returned: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first reactor did not stop")
+	}
+
+	second, _ := startTestReactor(t, cfg)
+	recoveredConn, err := net.Dial("tcp", second.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recoveredConn.Close()
+	if got := reactorCommand(t, recoveredConn, "GET", "durable"); got.Type != resp.BulkString || got.String != "value" {
+		t.Fatalf("recovered GET response = %+v", got)
+	}
+	if got := reactorCommand(t, recoveredConn, "GET", "after-rewrite"); got.Type != resp.BulkString || got.String != "also-durable" {
+		t.Fatalf("post-rewrite recovered GET response = %+v", got)
+	}
+	if got := reactorCommand(t, recoveredConn, "LRANGE", "queue", "0", "-1"); got.Type != resp.Array ||
+		len(got.Array) != 2 || got.Array[0].String != "one" || got.Array[1].String != "two" {
+		t.Fatalf("recovered LRANGE response = %+v", got)
 	}
 }

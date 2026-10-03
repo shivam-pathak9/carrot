@@ -49,6 +49,9 @@ func TestDefaultOperationalConfig(t *testing.T) {
 	if cfg.ReadTimeout <= 0 || cfg.WriteTimeout <= 0 {
 		t.Errorf("timeouts must be positive: read=%s write=%s", cfg.ReadTimeout, cfg.WriteTimeout)
 	}
+	if !cfg.AOFEnabled || cfg.AOFPath != "appendonly.aof" || cfg.AOFSyncPolicy != "everysec" {
+		t.Errorf("unexpected AOF defaults: enabled=%t path=%q sync=%q", cfg.AOFEnabled, cfg.AOFPath, cfg.AOFSyncPolicy)
+	}
 }
 
 func TestConfigValidation(t *testing.T) {
@@ -70,6 +73,8 @@ func TestConfigValidation(t *testing.T) {
 		{"negative response limit", func(c *Config) { c.MaxResponseBytes = -1 }, "max response"},
 		{"zero read timeout", func(c *Config) { c.ReadTimeout = 0 }, "read timeout"},
 		{"negative write timeout", func(c *Config) { c.WriteTimeout = -1 }, "write timeout"},
+		{"empty AOF path", func(c *Config) { c.AOFPath = " " }, "AOF path"},
+		{"invalid AOF sync policy", func(c *Config) { c.AOFSyncPolicy = "sometimes" }, "AOF sync policy"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			cfg := valid

@@ -4,12 +4,14 @@
 package reactor
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"strconv"
 	"sync"
 
+	"github.com/shivam-pathak9/carrot/internal/aof"
 	"github.com/shivam-pathak9/carrot/internal/command"
 	"github.com/shivam-pathak9/carrot/internal/config"
 	"github.com/shivam-pathak9/carrot/internal/storage"
@@ -39,6 +41,8 @@ type Server struct {
 	store    *storage.Store    // Shared storage engine handle
 	parser   *command.Parser   // Shared command parser
 	executor *command.Executor // Shared command executor
+	aof      *aof.Log
+	aofMu    sync.Mutex
 }
 
 // NewServer creates a reactor server with fresh in-memory storage and command handlers.
@@ -72,10 +76,16 @@ func (s *Server) Addr() net.Addr {
 //  5. NewPoller        : Creates epoll instance via unix.EpollCreate1.
 //  6. poller.Register  : Registers listener socket FD in epoll interest list for EPOLLIN (incoming connections).
 //  7. eventLoop.Run    : Starts infinite epoll_wait event loop with Active Expiration cycle.
-func (s *Server) Start() error {
+func (s *Server) Start() (startErr error) {
 	if err := s.config.Validate(); err != nil {
 		return fmt.Errorf("invalid reactor configuration: %w", err)
 	}
+	if err := s.openPersistence(); err != nil {
+		return err
+	}
+	defer func() {
+		startErr = errors.Join(startErr, s.closePersistence())
+	}()
 	// Parse port string configuration to integer
 	portInt, err := strconv.Atoi(s.config.Port)
 	if err != nil {
@@ -185,6 +195,40 @@ func (s *Server) Start() error {
 // Stop cleanly stops the reactor server and closes listener socket resources.
 func (s *Server) Stop() {
 	s.stopOnce.Do(func() { close(s.stopChan) })
+}
+
+// openPersistence recovers the AOF before the event loop accepts client
+// commands, then installs it as the executor's write-ahead journal.
+func (s *Server) openPersistence() error {
+	if !s.config.AOFEnabled {
+		return nil
+	}
+	s.aofMu.Lock()
+	defer s.aofMu.Unlock()
+	if s.aof != nil {
+		return nil
+	}
+	logFile, err := aof.Open(s.config.AOFPath, s.config.AOFSyncPolicy, s.store)
+	if err != nil {
+		return err
+	}
+	s.aof = logFile
+	s.executor.SetJournal(logFile)
+	return nil
+}
+
+// closePersistence removes the journal from the executor and closes the AOF.
+// It is safe to call when AOF is disabled or was never successfully opened.
+func (s *Server) closePersistence() error {
+	s.aofMu.Lock()
+	defer s.aofMu.Unlock()
+	if s.aof == nil {
+		return nil
+	}
+	err := s.aof.Close()
+	s.aof = nil
+	s.executor.SetJournal(nil)
+	return err
 }
 
 func zoneToInt(zone string) uint32 {

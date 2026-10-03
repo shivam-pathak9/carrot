@@ -18,6 +18,9 @@ type Config struct {
 	MaxResponseBytes int
 	ReadTimeout      time.Duration
 	WriteTimeout     time.Duration
+	AOFEnabled       bool
+	AOFPath          string
+	AOFSyncPolicy    string
 }
 
 // DefaultConfig returns the server's baseline settings, including its bind address.
@@ -30,6 +33,9 @@ func DefaultConfig() Config {
 		MaxResponseBytes: 4 << 20,
 		ReadTimeout:      30 * time.Second,
 		WriteTimeout:     10 * time.Second,
+		AOFEnabled:       true,
+		AOFPath:          "appendonly.aof",
+		AOFSyncPolicy:    "everysec",
 	}
 }
 
@@ -51,6 +57,12 @@ func (c Config) WithDefaults() Config {
 	}
 	if c.WriteTimeout == 0 {
 		c.WriteTimeout = defaults.WriteTimeout
+	}
+	if c.AOFPath == "" && c.AOFEnabled {
+		c.AOFPath = defaults.AOFPath
+	}
+	if c.AOFSyncPolicy == "" {
+		c.AOFSyncPolicy = defaults.AOFSyncPolicy
 	}
 	return c
 }
@@ -81,6 +93,16 @@ func (c Config) Validate() error {
 	}
 	if c.WriteTimeout <= 0 {
 		return fmt.Errorf("write timeout must be greater than zero")
+	}
+	if c.AOFEnabled {
+		if strings.TrimSpace(c.AOFPath) == "" {
+			return fmt.Errorf("AOF path must not be empty when AOF is enabled")
+		}
+		switch c.AOFSyncPolicy {
+		case "always", "everysec", "no":
+		default:
+			return fmt.Errorf("AOF sync policy must be one of: always, everysec, no")
+		}
 	}
 	return nil
 }

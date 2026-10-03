@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -16,6 +17,9 @@ import (
 
 func startTestServer(t *testing.T, cfg config.Config) (*Server, <-chan error) {
 	t.Helper()
+	if cfg.AOFEnabled && (cfg.AOFPath == "" || cfg.AOFPath == "appendonly.aof") {
+		cfg.AOFPath = filepath.Join(t.TempDir(), "appendonly.aof")
+	}
 	srv := NewServer(cfg)
 	result := make(chan error, 1)
 	done := make(chan struct{})
@@ -246,6 +250,7 @@ func TestServerShutdownWaitsForActiveClients(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	deadline := time.Now().Add(time.Second)
 	for {
 		srv.mu.Lock()
@@ -278,5 +283,57 @@ func TestServerShutdownWaitsForActiveClients(t *testing.T) {
 	}
 	if err := <-result; err != nil {
 		t.Fatalf("Start() returned %v after shutdown", err)
+	}
+}
+
+func TestServerRecoversAOFBeforeAcceptingClients(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Host = "127.0.0.1"
+	cfg.Port = "0"
+	cfg.AOFSyncPolicy = "always"
+	cfg.AOFPath = filepath.Join(t.TempDir(), "restart.aof")
+
+	first, firstResult := startTestServer(t, cfg)
+	conn, err := net.Dial("tcp", first.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sendRESP(t, conn, "SET", "durable", "value"); got.Type != resp.SimpleString {
+		t.Fatalf("SET response = %+v", got)
+	}
+	if got := sendRESP(t, conn, "LPUSH", "queue", "one", "two"); got.Type != resp.Integer {
+		t.Fatalf("LPUSH response = %+v", got)
+	}
+	if got := sendRESP(t, conn, "AOFREWRITE"); got.Type != resp.SimpleString || got.String != "OK" {
+		t.Fatalf("AOFREWRITE response = %+v", got)
+	}
+	if got := sendRESP(t, conn, "SET", "after-rewrite", "also-durable"); got.Type != resp.SimpleString {
+		t.Fatalf("SET after AOFREWRITE response = %+v", got)
+	}
+	_ = conn.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := first.Shutdown(ctx); err != nil {
+		t.Fatalf("first shutdown: %v", err)
+	}
+	if err := <-firstResult; err != nil {
+		t.Fatalf("first server returned: %v", err)
+	}
+
+	second, _ := startTestServer(t, cfg)
+	recoveredConn, err := net.Dial("tcp", second.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recoveredConn.Close()
+	if got := sendRESP(t, recoveredConn, "GET", "durable"); got.Type != resp.BulkString || got.String != "value" {
+		t.Fatalf("recovered GET response = %+v", got)
+	}
+	if got := sendRESP(t, recoveredConn, "GET", "after-rewrite"); got.Type != resp.BulkString || got.String != "also-durable" {
+		t.Fatalf("post-rewrite recovered GET response = %+v", got)
+	}
+	if got := sendRESP(t, recoveredConn, "LRANGE", "queue", "0", "-1"); got.Type != resp.Array ||
+		len(got.Array) != 2 || got.Array[0].String != "two" || got.Array[1].String != "one" {
+		t.Fatalf("recovered LRANGE response = %+v", got)
 	}
 }

@@ -1,12 +1,35 @@
 package command
 
 import (
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/shivam-pathak9/carrot/internal/protocol/resp"
 	"github.com/shivam-pathak9/carrot/internal/storage"
 )
+
+type failedJournal struct{}
+
+func (failedJournal) Append(Command) (Command, error) {
+	return Command{}, errors.New("disk unavailable")
+}
+
+func TestMutationIsNotAppliedWhenJournalAppendFails(t *testing.T) {
+	store := storage.NewStore()
+	executor := NewExecutor(store)
+	executor.SetJournal(failedJournal{})
+	if _, err := executor.Execute(Command{Name: "SET", Args: []string{"key", "value"}}); err == nil {
+		t.Fatal("write should fail when persistence append fails")
+	}
+	value, err := executor.Execute(Command{Name: "GET", Args: []string{"key"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value.Type != resp.BulkString || !value.IsNull {
+		t.Fatalf("GET after failed SET = %+v, want null", value)
+	}
+}
 
 // TestNewParser tests parser creation
 func TestNewParser(t *testing.T) {

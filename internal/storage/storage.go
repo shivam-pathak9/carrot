@@ -15,6 +15,17 @@ type Obj struct {
 	list      listValue
 }
 
+// SnapshotEntry is a stable copy of one live key returned during an AOF
+// rewrite. List values are copied so callers can encode them after the shard
+// lock has been released.
+type SnapshotEntry struct {
+	Key       string
+	Value     string
+	ExpiresAt time.Time
+	Kind      ValueKind
+	List      []string
+}
+
 // IsExpired reports whether the object has an expiration timestamp set and is expired as of time `now`.
 func (o Obj) IsExpired(now time.Time) bool {
 	return !o.ExpiresAt.IsZero() && !now.Before(o.ExpiresAt)
@@ -112,6 +123,24 @@ func (s *Store) Set(key string, value string, ttl time.Duration) {
 	}
 }
 
+// SetAt stores a string with an absolute expiration deadline. A deadline that
+// has already passed removes the key instead of creating a persistent value.
+func (s *Store) SetAt(key, value string, expiresAt time.Time) {
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	if !time.Now().Before(expiresAt) {
+		delete(sh.data, key)
+		return
+	}
+	sh.data[key] = Obj{
+		Value:     value,
+		ExpiresAt: expiresAt,
+		Kind:      StringKind,
+	}
+}
+
 // Get returns the stored value for key if it still exists and has not expired.
 //
 // Expired keys are removed lazily on access, which matches the common Redis pattern for
@@ -186,6 +215,16 @@ func (s *Store) Del(key string) bool {
 // A non-positive seconds value removes the key. If the key does not exist or is already expired,
 // the call returns false.
 func (s *Store) Expire(key string, seconds int64) bool {
+	deadline := time.Now()
+	if seconds > 0 {
+		deadline = deadline.Add(time.Duration(seconds) * time.Second)
+	}
+	return s.ExpireAt(key, deadline)
+}
+
+// ExpireAt assigns an absolute expiration deadline to an existing key.
+// A deadline in the past deletes the key and still reports success.
+func (s *Store) ExpireAt(key string, expiresAt time.Time) bool {
 	sh := s.getShard(key)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
@@ -202,12 +241,12 @@ func (s *Store) Expire(key string, seconds int64) bool {
 		return false
 	}
 
-	if seconds <= 0 {
+	if !time.Now().Before(expiresAt) {
 		delete(sh.data, key)
 		return true
 	}
 
-	obj.ExpiresAt = time.Now().Add(time.Duration(seconds) * time.Second)
+	obj.ExpiresAt = expiresAt
 	sh.data[key] = obj
 	return true
 }
@@ -286,6 +325,49 @@ func (s *Store) ActiveExpireCycle() int {
 	}
 
 	return totalDeleted
+}
+
+// ForEachSnapshot visits every currently live key without copying the entire
+// database at once. It stores only one shard's key names and copies one value
+// (including that key's list, if any) at a time. The callback runs after the
+// shard lock is released so slow disk writes do not hold storage locks. The
+// caller must prevent normal writes while taking the snapshot if it needs a
+// point-in-time view across the whole database.
+func (s *Store) ForEachSnapshot(visit func(SnapshotEntry) error) error {
+	now := time.Now()
+	for shardIndex := range s.shards {
+		sh := &s.shards[shardIndex]
+		keys := make([]string, 0)
+		sh.mu.RLock()
+		for key := range sh.data {
+			keys = append(keys, key)
+		}
+		sh.mu.RUnlock()
+
+		for _, key := range keys {
+			sh.mu.RLock()
+			obj, exists := sh.data[key]
+			if !exists || obj.IsExpired(now) {
+				sh.mu.RUnlock()
+				continue
+			}
+			entry := SnapshotEntry{
+				Key:       key,
+				Value:     obj.Value,
+				ExpiresAt: obj.ExpiresAt,
+				Kind:      obj.Kind,
+			}
+			if obj.Kind == ListKind {
+				entry.List = obj.list.rangeCopy(0, obj.list.Len())
+			}
+			sh.mu.RUnlock()
+
+			if err := visit(entry); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // getRawObj returns the internal Obj stored at key (used for tests and internal assertions).

@@ -26,6 +26,9 @@ func main() {
 	flag.IntVar(&cfg.MaxResponseBytes, "max-response-bytes", cfg.MaxResponseBytes, "maximum bytes per RESP response")
 	flag.DurationVar(&cfg.ReadTimeout, "read-timeout", cfg.ReadTimeout, "client read inactivity timeout")
 	flag.DurationVar(&cfg.WriteTimeout, "write-timeout", cfg.WriteTimeout, "client response write timeout")
+	flag.BoolVar(&cfg.AOFEnabled, "aof-enabled", cfg.AOFEnabled, "enable append-only persistence")
+	flag.StringVar(&cfg.AOFPath, "aof-file", cfg.AOFPath, "append-only persistence file")
+	flag.StringVar(&cfg.AOFSyncPolicy, "aof-sync", cfg.AOFSyncPolicy, "AOF sync policy: always, everysec, or no")
 	flag.Parse()
 
 	if err := cfg.Validate(); err != nil {
