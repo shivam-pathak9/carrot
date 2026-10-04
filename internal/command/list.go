@@ -12,7 +12,7 @@ import (
 	"github.com/shivam-pathak9/carrot/internal/storage"
 )
 
-func listError(err error) resp.Value {
+func storageError(err error) resp.Value {
 	switch {
 	case errors.Is(err, storage.ErrWrongType):
 		return resp.NewError(storage.ErrWrongType.Error())
@@ -45,7 +45,7 @@ func handleListCommand(name string, store *storage.Store, args []string) (resp.V
 		}
 		length, err := store.ListLen(args[0])
 		if err != nil {
-			return listError(err), nil
+			return storageError(err), nil
 		}
 		return resp.NewInteger(length), nil
 	case "LRANGE":
@@ -62,7 +62,7 @@ func handleListCommand(name string, store *storage.Store, args []string) (resp.V
 		}
 		values, err := store.ListRange(args[0], start, stop)
 		if err != nil {
-			return listError(err), nil
+			return storageError(err), nil
 		}
 		return stringArray(values), nil
 	case "LINDEX":
@@ -75,7 +75,7 @@ func handleListCommand(name string, store *storage.Store, args []string) (resp.V
 		}
 		value, found, err := store.ListIndex(args[0], index)
 		if err != nil {
-			return listError(err), nil
+			return storageError(err), nil
 		}
 		if !found {
 			return resp.NewNullBulkString(), nil
@@ -90,7 +90,7 @@ func handleListCommand(name string, store *storage.Store, args []string) (resp.V
 			return resp.NewError(err.Error()), nil
 		}
 		if err := store.ListSet(args[0], index, args[2]); err != nil {
-			return listError(err), nil
+			return storageError(err), nil
 		}
 		return resp.NewSimpleString("OK"), nil
 	case "LTRIM":
@@ -106,7 +106,7 @@ func handleListCommand(name string, store *storage.Store, args []string) (resp.V
 			return resp.NewError(err.Error()), nil
 		}
 		if err := store.ListTrim(args[0], start, stop); err != nil {
-			return listError(err), nil
+			return storageError(err), nil
 		}
 		return resp.NewSimpleString("OK"), nil
 	case "LREM":
@@ -119,7 +119,7 @@ func handleListCommand(name string, store *storage.Store, args []string) (resp.V
 		}
 		removed, err := store.ListRem(args[0], count, args[2])
 		if err != nil {
-			return listError(err), nil
+			return storageError(err), nil
 		}
 		return resp.NewInteger(removed), nil
 	case "LINSERT":
@@ -132,7 +132,7 @@ func handleListCommand(name string, store *storage.Store, args []string) (resp.V
 		}
 		length, err := store.ListInsert(args[0], args[2], args[3], before)
 		if err != nil {
-			return listError(err), nil
+			return storageError(err), nil
 		}
 		return resp.NewInteger(length), nil
 	case "LMOVE":
@@ -149,7 +149,7 @@ func handleListCommand(name string, store *storage.Store, args []string) (resp.V
 		}
 		value, found, err := store.ListMove(args[0], args[1], fromLeft, toLeft)
 		if err != nil {
-			return listError(err), nil
+			return storageError(err), nil
 		}
 		if !found {
 			return resp.NewNullBulkString(), nil
@@ -161,7 +161,7 @@ func handleListCommand(name string, store *storage.Store, args []string) (resp.V
 		}
 		value, found, err := store.ListMove(args[0], args[1], false, true)
 		if err != nil {
-			return listError(err), nil
+			return storageError(err), nil
 		}
 		if !found {
 			return resp.NewNullBulkString(), nil
@@ -182,7 +182,7 @@ func handleListPush(name string, store *storage.Store, args []string) (resp.Valu
 	onlyExisting := name == "LPUSHX" || name == "RPUSHX"
 	length, err := store.ListPush(args[0], args[1:], left, onlyExisting)
 	if err != nil {
-		return listError(err), nil
+		return storageError(err), nil
 	}
 	return resp.NewInteger(length), nil
 }
@@ -205,7 +205,7 @@ func handleListPop(name string, store *storage.Store, args []string) (resp.Value
 	}
 	values, err := store.ListPop(args[0], name == "LPOP", count)
 	if err != nil {
-		return listError(err), nil
+		return storageError(err), nil
 	}
 	if withCount {
 		return stringArray(values), nil
@@ -256,7 +256,7 @@ func handleListPosition(store *storage.Store, args []string) (resp.Value, error)
 	}
 	positions, err := store.ListPosition(args[0], args[1], rank, count, maxLen)
 	if err != nil {
-		return listError(err), nil
+		return storageError(err), nil
 	}
 	if !countSpecified || count == 1 {
 		if len(positions) == 0 {

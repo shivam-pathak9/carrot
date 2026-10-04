@@ -2,6 +2,9 @@ package command
 
 import (
 	"errors"
+	"fmt"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,6 +33,104 @@ func TestMutationIsNotAppliedWhenJournalAppendFails(t *testing.T) {
 		t.Fatalf("GET after failed SET = %+v, want null", value)
 	}
 }
+
+type blockingRewriteJournal struct {
+	mu       sync.Mutex
+	events   []string
+	started  chan struct{}
+	release  chan struct{}
+	appended chan struct{}
+}
+
+func (j *blockingRewriteJournal) Append(cmd Command) (Command, error) {
+	j.mu.Lock()
+	j.events = append(j.events, "append:"+cmd.Args[0])
+	j.mu.Unlock()
+	close(j.appended)
+	return cmd, nil
+}
+
+func (j *blockingRewriteJournal) Rewrite(*storage.Store) error {
+	close(j.started)
+	<-j.release
+	j.mu.Lock()
+	j.events = append(j.events, "rewrite")
+	j.mu.Unlock()
+	return nil
+}
+
+func TestAOFRewriteBlocksMutationsUntilReplacementIsReady(t *testing.T) {
+	journal := &blockingRewriteJournal{
+		started:  make(chan struct{}),
+		release:  make(chan struct{}),
+		appended: make(chan struct{}),
+	}
+	executor := NewExecutor(storage.NewStore())
+	executor.SetJournal(journal)
+
+	rewriteDone := make(chan error, 1)
+	go func() {
+		_, err := executor.Execute(Command{Name: "AOFREWRITE"})
+		rewriteDone <- err
+	}()
+	select {
+	case <-journal.started:
+	case <-time.After(time.Second):
+		t.Fatal("rewrite did not start")
+	}
+
+	writeStarted := make(chan struct{})
+	writeDone := make(chan error, 1)
+	go func() {
+		close(writeStarted)
+		_, err := executor.Execute(Command{Name: "SET", Args: []string{"during-rewrite", "value"}})
+		writeDone <- err
+	}()
+	<-writeStarted
+	select {
+	case <-journal.appended:
+		t.Fatal("mutation was appended before rewrite finished")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(journal.release)
+	select {
+	case err := <-rewriteDone:
+		if err != nil {
+			t.Fatalf("AOFREWRITE failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("rewrite did not finish after release")
+	}
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatalf("mutation after rewrite failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("mutation did not continue after rewrite")
+	}
+
+	journal.mu.Lock()
+	defer journal.mu.Unlock()
+	if len(journal.events) != 2 || journal.events[0] != "rewrite" || journal.events[1] != "append:during-rewrite" {
+		t.Fatalf("journal order = %v, want [rewrite append:during-rewrite]", journal.events)
+	}
+}
+
+func TestAOFRewriteReturnsJournalFailure(t *testing.T) {
+	journal := failingRewriteJournal{}
+	executor := NewExecutor(storage.NewStore())
+	executor.SetJournal(journal)
+	if _, err := executor.Execute(Command{Name: "AOFREWRITE"}); err == nil || err.Error() != "rewrite failed" {
+		t.Fatalf("AOFREWRITE error = %v, want rewrite failed", err)
+	}
+}
+
+type failingRewriteJournal struct{}
+
+func (failingRewriteJournal) Append(cmd Command) (Command, error) { return cmd, nil }
+func (failingRewriteJournal) Rewrite(*storage.Store) error        { return fmt.Errorf("rewrite failed") }
 
 // TestNewParser tests parser creation
 func TestNewParser(t *testing.T) {
@@ -440,7 +541,6 @@ func TestExecuteExpire(t *testing.T) {
 		Name: "EXPIRE",
 		Args: []string{"key", "60"},
 	}
-
 	result, err := executor.Execute(cmd)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
@@ -450,6 +550,112 @@ func TestExecuteExpire(t *testing.T) {
 	}
 	if result.Integer != 1 {
 		t.Errorf("Expected 1 for successful expire, got %d", result.Integer)
+	}
+}
+
+func TestExpirationCommandEdgeCases(t *testing.T) {
+	nowMillis := time.Now().UnixMilli()
+	tests := []struct {
+		name       string
+		setup      func(*storage.Store)
+		command    Command
+		wantType   resp.Type
+		wantValue  int64
+		wantExists bool
+	}{
+		{
+			name:      "TTL missing key",
+			command:   Command{Name: "TTL", Args: []string{"missing"}},
+			wantType:  resp.Integer,
+			wantValue: -2,
+		},
+		{
+			name: "TTL persistent key",
+			setup: func(store *storage.Store) {
+				store.Set("key", "value", 0)
+			},
+			command:    Command{Name: "TTL", Args: []string{"key"}},
+			wantType:   resp.Integer,
+			wantValue:  -1,
+			wantExists: true,
+		},
+		{
+			name:     "SET rejects zero expiration",
+			command:  Command{Name: "SET", Args: []string{"key", "value", "EX", "0"}},
+			wantType: resp.Error,
+		},
+		{
+			name: "EXPIRE zero removes existing key",
+			setup: func(store *storage.Store) {
+				store.Set("key", "value", 0)
+			},
+			command:   Command{Name: "EXPIRE", Args: []string{"key", "0"}},
+			wantType:  resp.Integer,
+			wantValue: 1,
+		},
+		{
+			name: "EXPIRE negative removes existing key",
+			setup: func(store *storage.Store) {
+				store.Set("key", "value", 0)
+			},
+			command:   Command{Name: "EXPIRE", Args: []string{"key", "-1"}},
+			wantType:  resp.Integer,
+			wantValue: 1,
+		},
+		{
+			name: "PEXPIREAT past removes existing key",
+			setup: func(store *storage.Store) {
+				store.Set("key", "value", 0)
+			},
+			command:   Command{Name: "PEXPIREAT", Args: []string{"key", strconv.FormatInt(nowMillis-1000, 10)}},
+			wantType:  resp.Integer,
+			wantValue: 1,
+		},
+		{
+			name:      "PEXPIREAT missing key",
+			command:   Command{Name: "PEXPIREAT", Args: []string{"missing", strconv.FormatInt(nowMillis-1000, 10)}},
+			wantType:  resp.Integer,
+			wantValue: 0,
+		},
+		{
+			name: "SET PXAT past leaves key absent",
+			command: Command{
+				Name: "SET",
+				Args: []string{"key", "value", "PXAT", strconv.FormatInt(nowMillis-1000, 10)},
+			},
+			wantType: resp.SimpleString,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := storage.NewStore()
+			if test.setup != nil {
+				test.setup(store)
+			}
+			result, err := NewExecutor(store).Execute(test.command)
+			if err != nil {
+				t.Fatalf("Execute(%s): %v", test.command.Name, err)
+			}
+			if result.Type != test.wantType {
+				t.Fatalf("response type = %v, want %v (%+v)", result.Type, test.wantType, result)
+			}
+			if test.wantType == resp.Integer && result.Integer != test.wantValue {
+				t.Fatalf("response integer = %d, want %d", result.Integer, test.wantValue)
+			}
+			if test.wantExists {
+				if _, exists := store.Get("key"); !exists {
+					t.Fatal("key unexpectedly absent")
+				}
+				return
+			}
+			if test.command.Name == "TTL" && test.command.Args[0] == "missing" {
+				return
+			}
+			if _, exists := store.Get("key"); exists {
+				t.Fatal("key unexpectedly exists after expiration command")
+			}
+		})
 	}
 }
 

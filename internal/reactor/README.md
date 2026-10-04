@@ -4,6 +4,12 @@ This package (`internal/reactor`) implements a single-threaded **Reactor Event L
 
 It provides non-blocking, asynchronous I/O multiplexing for TCP client connections—similar to the core networking architecture used by Redis, Nginx, and Node.js.
 
+This is a reactor-subsystem guide. The repository-wide implementation
+reference is the root [HLD](../../HLD.md) and [LLD](../../LLD.md); use those
+documents and the Go source for current behavior. Any capacity or latency
+figures in this guide are illustrative unless tied to reproducible
+measurements.
+
 ---
 
 ## High-Level Architecture (HLD)
@@ -225,4 +231,3 @@ Let's trace what happens when a client sends `PING hello`:
 10. **State Clean Up**: Input buffer advanced, output buffer cleared, event loop waits for next event.
 
 ---
-

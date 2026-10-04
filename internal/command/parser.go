@@ -12,9 +12,6 @@ type Parser struct{}
 
 // NewParser creates a stateless parser for RESP command arrays.
 func NewParser() *Parser {
-	// NewParser returns a new command parser. Parser has no state
-	// for now but is provided as a type to keep parsing logic
-	// encapsulated and testable.
 	return &Parser{}
 }
 
@@ -22,11 +19,6 @@ func NewParser() *Parser {
 // The command name is normalized to uppercase; arguments retain their original
 // spelling and order.
 func (p *Parser) Parse(value resp.Value) (Command, error) {
-	// Parse converts a RESP `Value` (expected to be an Array)
-	// into a `Command` with a name and arguments. It performs
-	// protocol validation and returns clear protocol errors when
-	// the incoming value is malformed.
-
 	// Redis commands always arrive as RESP Arrays.
 	if value.Type != resp.Array {
 		return Command{}, fmt.Errorf("ERR protocol error: expected array")

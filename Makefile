@@ -1,0 +1,27 @@
+.PHONY: build test test-race cover vet fmt-check check benchmark
+
+build:
+	go build ./...
+
+test:
+	go test ./...
+
+test-race:
+	go test -race ./...
+
+cover:
+	go test -cover ./...
+
+vet:
+	go vet ./...
+
+fmt-check:
+	@test -z "$$(gofmt -l $$(find cmd internal -type f -name '*.go'))" || \
+		(gofmt -l $$(find cmd internal -type f -name '*.go'); exit 1)
+
+check: fmt-check test test-race cover vet build
+
+benchmark:
+	@command -v redis-benchmark >/dev/null || \
+		(echo "redis-benchmark is required (Redis CLI tools)" >&2; exit 1)
+	./scripts/benchmark.sh

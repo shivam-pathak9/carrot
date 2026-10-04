@@ -40,6 +40,7 @@ func handleExpire(store *storage.Store, args []string) (resp.Value, error) {
 	return resp.NewInteger(1), nil
 }
 
+// handleExpireAt executes PEXPIREAT using an absolute Unix timestamp in milliseconds.
 func handleExpireAt(store *storage.Store, args []string) (resp.Value, error) {
 	if len(args) != 2 {
 		return resp.NewError("ERR wrong number of arguments for 'pexpireat' command"), nil

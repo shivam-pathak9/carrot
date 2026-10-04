@@ -327,7 +327,6 @@ func (l *Log) Append(cmd command.Command) (command.Command, error) {
 // bytes for a valid record. If truncation, repositioning, or syncing the
 // rollback fails, the log is marked unhealthy and rejects future appends.
 func (l *Log) rollback(offset int64, cause error) error {
-	l.writer.Reset(l.file)
 	if err := l.file.Truncate(offset); err != nil {
 		l.failed = errors.Join(cause, fmt.Errorf("truncate failed AOF append: %w", err))
 		return l.failed
@@ -449,7 +448,7 @@ func replay(file *os.File, store *storage.Store) error {
 		if err != nil {
 			return fmt.Errorf("parse command at byte %d: %w", goodOffset, err)
 		}
-		if !isPersistedMutation(parsed.Name) {
+		if !command.IsMutation(parsed.Name) {
 			return fmt.Errorf("unexpected non-mutation %q in AOF at byte %d", parsed.Name, goodOffset)
 		}
 		if _, err := executor.Execute(parsed); err != nil {
@@ -458,20 +457,6 @@ func replay(file *os.File, store *storage.Store) error {
 		goodOffset = offset
 	}
 	return nil
-}
-
-// isPersistedMutation restricts replay to commands that can legitimately
-// appear in this AOF; the list must stay aligned with executor mutation
-// handling and the command families supported by persistence.
-func isPersistedMutation(name string) bool {
-	switch name {
-	case "SET", "DEL", "EXPIRE", "PEXPIREAT",
-		"LPUSH", "RPUSH", "LPUSHX", "RPUSHX", "LPOP", "RPOP",
-		"LSET", "LTRIM", "LREM", "LINSERT", "LMOVE", "RPOPLPUSH":
-		return true
-	default:
-		return false
-	}
 }
 
 // canonicalCommand makes a copy of a mutation suitable for stable replay.
@@ -531,6 +516,12 @@ func canonicalCommand(cmd command.Command, now time.Time) (command.Command, bool
 			return command.Command{}, false
 		}
 	default:
+		if !command.IsMutation(copyCommand.Name) {
+			return command.Command{}, false
+		}
+		// Current mutations other than SET and EXPIRE have no relative time
+		// arguments. Add explicit normalization above if a future mutation
+		// introduces a relative expiration.
 	}
 	return copyCommand, true
 }

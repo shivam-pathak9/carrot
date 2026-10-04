@@ -2,6 +2,12 @@
 
 Welcome to the internal architectural documentation for **Carrot Reactor**—a single-threaded, non-blocking TCP server built on Linux `epoll` system calls (`golang.org/x/sys/unix`).
 
+This is a reactor-subsystem walkthrough, not the repository-wide source of
+truth. For current cross-package behavior and implementation limits, see the
+root [HLD](../../HLD.md) and [LLD](../../LLD.md), then verify details against
+the Go source. Illustrative performance, latency, and capacity claims below
+are not measurements unless explicitly backed by a reproducible benchmark.
+
 This document provides a complete, step-by-step walkthrough of the entire server lifecycle: from socket creation and kernel epoll registration to non-blocking connection accepting, RESP request processing, socket buffer management, framing rewinds, remote peer resolution, and graceful shutdown.
 
 ---

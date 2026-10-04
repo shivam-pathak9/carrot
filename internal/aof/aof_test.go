@@ -238,8 +238,36 @@ func TestCanonicalCommandSkipsMalformedExpirations(t *testing.T) {
 		}
 	}
 
-	if isPersistedMutation("GET") {
+	if command.IsMutation("GET") {
 		t.Fatal("GET must not be persisted as a mutation")
+	}
+}
+
+func TestCanonicalCommandAcceptsEveryKnownMutationFamily(t *testing.T) {
+	for _, cmd := range []command.Command{
+		{Name: "SET", Args: []string{"key", "value"}},
+		{Name: "DEL", Args: []string{"key"}},
+		{Name: "EXPIRE", Args: []string{"key", "0"}},
+		{Name: "PEXPIREAT", Args: []string{"key", "123"}},
+		{Name: "LPUSH", Args: []string{"list", "value"}},
+		{Name: "RPUSH", Args: []string{"list", "value"}},
+		{Name: "LPUSHX", Args: []string{"list", "value"}},
+		{Name: "RPUSHX", Args: []string{"list", "value"}},
+		{Name: "LPOP", Args: []string{"list"}},
+		{Name: "RPOP", Args: []string{"list"}},
+		{Name: "LSET", Args: []string{"list", "0", "value"}},
+		{Name: "LTRIM", Args: []string{"list", "0", "-1"}},
+		{Name: "LREM", Args: []string{"list", "0", "value"}},
+		{Name: "LINSERT", Args: []string{"list", "BEFORE", "pivot", "value"}},
+		{Name: "LMOVE", Args: []string{"src", "dst", "LEFT", "RIGHT"}},
+		{Name: "RPOPLPUSH", Args: []string{"src", "dst"}},
+	} {
+		if !command.IsMutation(cmd.Name) {
+			t.Fatalf("%s is missing from mutation classification", cmd.Name)
+		}
+		if _, ok := canonicalCommand(cmd, time.Now()); !ok {
+			t.Errorf("canonicalCommand(%+v) rejected a known mutation", cmd)
+		}
 	}
 }
 
@@ -362,6 +390,66 @@ func TestAOFRewriteRequiresEnabledRewritableJournal(t *testing.T) {
 	if got, err := executor.Execute(command.Command{Name: "AOFREWRITE", Args: []string{"extra"}}); err != nil ||
 		got.Type != resp.Error {
 		t.Fatalf("AOFREWRITE with arguments = (%+v, %v), want RESP error", got, err)
+	}
+}
+
+func TestAOFRewriteFailureKeepsOriginalLogAndRemovesTempFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "appendonly.aof")
+	store := storage.NewStore()
+	logFile, err := Open(path, "always", store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := command.NewExecutor(store)
+	executor.SetJournal(logFile)
+	execute(t, executor, "SET", "original", "still-valid")
+
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Rewrite cannot emit a single RESP record larger than the recovery limit.
+	// This makes snapshot generation fail after creating the temporary file,
+	// exercising cleanup without relying on permissions that behave differently
+	// when tests run as root.
+	store.Set("oversized", strings.Repeat("x", maxRecordBytes+1), 0)
+	if err := executor.RewriteAOF(); err == nil {
+		t.Fatal("rewrite with an oversized current value should fail")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("failed rewrite changed the original AOF")
+	}
+	tempFiles, err := filepath.Glob(filepath.Join(filepath.Dir(path), ".appendonly.aof.rewrite-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tempFiles) != 0 {
+		t.Errorf("failed rewrite left temporary files behind: %v", tempFiles)
+	}
+
+	execute(t, executor, "SET", "after-failure", "writable")
+	if err := logFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	recovered := storage.NewStore()
+	recoveredLog, err := Open(path, "always", recovered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recoveredLog.Close()
+	recoveredExecutor := command.NewExecutor(recovered)
+	for key, want := range map[string]string{
+		"original":      "still-valid",
+		"after-failure": "writable",
+	} {
+		got := execute(t, recoveredExecutor, "GET", key)
+		if got.Type != resp.BulkString || got.String != want {
+			t.Errorf("recovered GET %q = %+v, want %q", key, got, want)
+		}
 	}
 }
 

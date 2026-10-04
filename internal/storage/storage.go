@@ -40,7 +40,8 @@ const (
 )
 
 // numShards specifies the number of independent memory partitions in the store.
-// 256 shards ensure high concurrency by dividing key access across 256 separate RWMutexes.
+// 256 is a fixed striping choice intended to reduce lock contention; it has not
+// been selected through a workload-specific shard-count benchmark.
 const numShards = 256
 
 // shard represents an isolated partition of the storage engine containing its own RWMutex and map.
@@ -120,6 +121,7 @@ func (s *Store) Set(key string, value string, ttl time.Duration) {
 	sh.data[key] = Obj{
 		Value:     value,
 		ExpiresAt: expiresAt,
+		Kind:      StringKind,
 	}
 }
 
@@ -177,7 +179,7 @@ func (s *Store) TTL(key string) int64 {
 		return -1
 	}
 
-	remaining := time.Until(obj.ExpiresAt).Seconds()
+	remaining := obj.ExpiresAt.Sub(now).Seconds()
 	if remaining < 0 {
 		delete(sh.data, key)
 		return -2
@@ -241,7 +243,7 @@ func (s *Store) ExpireAt(key string, expiresAt time.Time) bool {
 		return false
 	}
 
-	if !time.Now().Before(expiresAt) {
+	if !now.Before(expiresAt) {
 		delete(sh.data, key)
 		return true
 	}
@@ -368,21 +370,4 @@ func (s *Store) ForEachSnapshot(visit func(SnapshotEntry) error) error {
 		}
 	}
 	return nil
-}
-
-// getRawObj returns the internal Obj stored at key (used for tests and internal assertions).
-func (s *Store) getRawObj(key string) (Obj, bool) {
-	sh := s.getShard(key)
-	sh.mu.RLock()
-	defer sh.mu.RUnlock()
-	obj, exists := sh.data[key]
-	return obj, exists
-}
-
-// setRawObj directly sets an internal Obj for key (used for tests to seed expired state).
-func (s *Store) setRawObj(key string, obj Obj) {
-	sh := s.getShard(key)
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
-	sh.data[key] = obj
 }

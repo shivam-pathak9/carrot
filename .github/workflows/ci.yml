@@ -1,0 +1,46 @@
+name: Go CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check Go formatting
+        run: |
+          files="$(gofmt -l $(find cmd internal -type f -name '*.go'))"
+          if [ -n "$files" ]; then
+            printf 'Go files need formatting:\n%s\n' "$files"
+            exit 1
+          fi
+
+      - name: Test
+        run: go test ./...
+
+      - name: Race tests
+        run: go test -race ./...
+
+      - name: Coverage
+        run: go test -cover ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...

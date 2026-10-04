@@ -14,6 +14,47 @@ func TestNewStore(t *testing.T) {
 	}
 }
 
+func TestForEachSnapshotCopiesLiveValuesAndLists(t *testing.T) {
+	store := NewStore()
+	store.Set("string", "value", 0)
+	if _, err := store.ListPush("list", []string{"one", "two"}, false, false); err != nil {
+		t.Fatal(err)
+	}
+	store.setRawObj("expired", Obj{
+		Value:     "stale",
+		ExpiresAt: time.Now().Add(-time.Second),
+		Kind:      StringKind,
+	})
+
+	snapshot := make(map[string]SnapshotEntry)
+	if err := store.ForEachSnapshot(func(entry SnapshotEntry) error {
+		snapshot[entry.Key] = entry
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot) != 2 {
+		t.Fatalf("snapshot contains %d keys, want two live keys: %v", len(snapshot), snapshot)
+	}
+	if got := snapshot["string"].Value; got != "value" {
+		t.Fatalf("snapshot string = %q, want value", got)
+	}
+	if got := snapshot["list"].List; len(got) != 2 || got[0] != "one" || got[1] != "two" {
+		t.Fatalf("snapshot list = %v, want [one two]", got)
+	}
+	snapshot["list"].List[0] = "changed"
+	list, err := store.ListRange("list", 0, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if list[0] != "one" {
+		t.Fatalf("mutating snapshot changed store list: %v", list)
+	}
+	if _, ok := snapshot["expired"]; ok {
+		t.Fatal("snapshot included expired key")
+	}
+}
+
 // TestSetAndGet tests basic Set and Get operations
 func TestSetAndGet(t *testing.T) {
 	store := NewStore()

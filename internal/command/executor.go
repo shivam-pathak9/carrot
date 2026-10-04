@@ -58,7 +58,7 @@ func (e *Executor) Execute(cmd Command) (resp.Value, error) {
 		return resp.NewSimpleString("OK"), nil
 	}
 
-	if isMutation(cmd.Name) {
+	if IsMutation(cmd.Name) {
 		// Hold the lock across journal append and mutation so concurrent writes
 		// cannot be persisted in an order different from their in-memory order.
 		e.writeMu.Lock()
@@ -98,14 +98,7 @@ func (e *Executor) execute(cmd Command) (resp.Value, error) {
 	switch cmd.Name {
 
 	case "PING":
-		switch len(cmd.Args) {
-		case 0:
-			return resp.NewSimpleString("PONG"), nil
-		case 1:
-			return resp.NewBulkString(cmd.Args[0]), nil
-		default:
-			return resp.NewError("ERR wrong number of arguments for 'ping' command"), nil
-		}
+		return handlePing(cmd.Args), nil
 
 	case "GET":
 		return handleGet(e.store, cmd.Args)
@@ -137,9 +130,9 @@ func (e *Executor) execute(cmd Command) (resp.Value, error) {
 	}
 }
 
-// isMutation identifies commands that may change store state and therefore
-// must pass through the journal boundary before execution.
-func isMutation(name string) bool {
+// IsMutation reports whether a command can modify the store and must pass
+// through persistence ordering before execution or AOF replay.
+func IsMutation(name string) bool {
 	switch name {
 	case "SET", "DEL", "EXPIRE", "PEXPIREAT",
 		"LPUSH", "RPUSH", "LPUSHX", "RPUSHX", "LPOP", "RPOP",

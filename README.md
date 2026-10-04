@@ -9,6 +9,10 @@
   It is an in-memory development project progressing toward production readiness; it is not currently safe for production data.
 </p>
 
+<p align="center">
+  Architecture references: <a href="HLD.md">HLD</a> · <a href="LLD.md">LLD</a>
+</p>
+
 ---
 
 ## What this project includes
@@ -17,12 +21,13 @@ Carrot currently includes:
 
 - A RESP parser and encoder for Redis-style wire protocol messages
 - An in-memory storage layer with string and list values plus TTL support
-- Core commands: `PING`, `GET`, `SET`, `DEL`, `TTL`, and `EXPIRE`
+- String and expiration commands: `PING`, `GET`, `SET`, `DEL`, `TTL`, `EXPIRE`, and `PEXPIREAT`
+- AOF append, streaming recovery, configurable sync policies, and manual rewrite/compaction on Linux
 - Redis-style list commands including pushes, pops, ranges, indexed updates, trimming, removal, insertion, positions, and atomic moves
 - A per-connection goroutine server built with Go net listeners
 - A Linux epoll-based reactor server for non-blocking I/O
 - Scheduled background expiration cleanup for stale keys
-- A test suite covering storage, config, command behavior, and RESP parsing
+- Unit, TCP integration, and AOF recovery tests across the core packages
 
 ---
 
@@ -30,10 +35,14 @@ Carrot currently includes:
 
 - `cmd/server` — goroutine-based TCP server
 - `cmd/reactor-server` — epoll-based event loop server
+- `cmd/scale-server` — active-expiration scale demonstration; not a network load server
 - `internal/command` — command parsing and execution logic
 - `internal/config` — configuration defaults
 - `internal/protocol/resp` — RESP framing, encoder/decoder
 - `internal/storage` — Map-based in-memory key store with TTL support
+- `internal/aof` — Linux-only append-only persistence, replay, and compaction
+- `internal/server` — goroutine-server lifecycle and client handling
+- `internal/client` — client connection and protocol helpers
 - `internal/reactor` — reactor implementation and architecture docs
 
 ---
@@ -117,8 +126,9 @@ redis-cli -h 127.0.0.1 -p 6379 AOFREWRITE
 ```
 
 This initial rewrite is synchronous: writes pause until the temporary AOF is
-synced and atomically installed; reads continue. The server appends waiting
-writes to the replacement afterward.
+synced and atomically installed. Standard-server reads can proceed while the
+rewrite runs; the reactor's event loop cannot serve requests until its rewrite
+call returns. Waiting writes append to the replacement afterward.
 
 ### AOF rewrite smoke test
 
@@ -149,12 +159,14 @@ go run ./cmd/server -aof-enabled=false
 Both binaries handle `SIGINT` and `SIGTERM` for shutdown. The standard server
 stops accepting connections and waits for active clients, closing them if its
 10-second shutdown window expires. The reactor closes its clients and epoll
-resources during shutdown. The epoll implementation currently supports IPv4
-addresses only.
+resources during shutdown. Its listener accepts IPv4 and IPv6 address forms;
+dual-stack behavior for an IPv6 wildcard depends on host configuration.
 
-Run the test suite:
+Run the project checks:
 
 ```bash
+make check
+# Or run the Go commands individually:
 go test ./...
 go test -race ./...
 go test -cover ./...
@@ -163,6 +175,8 @@ go vet ./...
 ```
 
 Server and reactor TCP integration tests run as part of `go test ./...`.
+GitHub Actions runs formatting, tests, race tests, coverage, vet, and build
+checks on Linux for pushes and pull requests.
 
 ---
 
@@ -179,8 +193,10 @@ The project currently demonstrates:
 
 - A documented subset of RESP and Redis-style string/list commands
 - In-memory typed storage and TTL behavior
+- AOF append/recovery and manual rewrite/compaction
 - Two networking models: goroutine-per-connection and Linux epoll
-- Unit-test coverage for storage, commands, RESP, and configuration
+- Unit and TCP integration tests for storage, commands, persistence, protocol,
+  configuration, and both server implementations
 
 Important gaps before production use still include:
 
@@ -191,83 +207,68 @@ Important gaps before production use still include:
 
 ## Local benchmark
 
-The following is a single local comparison run made on 2026-10-02 with
-`redis-benchmark 7.0.15`. Both servers ran sequentially on the same WSL2 Linux
-host (`12` logical CPUs, Linux kernel `6.18.33.2-microsoft-standard-WSL2`),
-bound to loopback. Each benchmark case sent 10,000 requests using 10 concurrent
-clients, a 16-byte payload, and pipeline depth 1:
+The following repeatable local comparison was run on 2026-10-03 with
+`redis-benchmark 7.0.15`, Go 1.26.4, on WSL2 Linux/amd64 (`12` logical CPUs,
+kernel `6.18.33.2-microsoft-standard-WSL2`). Both servers bound to loopback;
+AOF was disabled to compare the network and in-memory command paths. Each of
+three rounds sent 10,000 requests per command with 10 concurrent clients, a
+16-byte payload, and pipeline depth 1. The table reports median throughput and
+median p50 latency across those three runs:
 
-```bash
-redis-benchmark -h 127.0.0.1 -p PORT \
-  -n 10000 -c 10 -d 16 -P 1 \
-  -t ping_inline,ping_mbulk,set,get,lpush,rpush,lpop,rpop
-```
-
-| Command | Goroutine server req/s | p50 / p95 / p99 (ms) | Reactor server req/s | p50 / p95 / p99 (ms) |
+| Command | Goroutine req/s | Goroutine p50 (ms) | Reactor req/s | Reactor p50 (ms) |
 |---|---:|---:|---:|---:|
-| PING_INLINE | 28,985.51 | 0.191 / 0.759 / 1.527 | 61,349.69 | 0.119 / 0.295 / 0.631 |
-| PING_MBULK | 37,313.43 | 0.167 / 0.511 / 1.055 | 64,102.56 | 0.127 / 0.271 / 0.487 |
-| SET | 37,174.72 | 0.167 / 0.527 / 1.015 | 60,606.06 | 0.135 / 0.287 / 0.623 |
-| GET | 35,087.72 | 0.175 / 0.543 / 1.111 | 58,139.53 | 0.143 / 0.303 / 0.623 |
-| LPUSH | 36,630.04 | 0.167 / 0.519 / 1.079 | 54,945.05 | 0.151 / 0.327 / 0.567 |
-| RPUSH | 34,843.21 | 0.175 / 0.575 / 1.135 | 53,475.93 | 0.143 / 0.359 / 0.551 |
-| LPOP | 34,843.21 | 0.175 / 0.559 / 1.071 | 47,846.89 | 0.167 / 0.415 / 0.615 |
-| RPOP | 33,112.59 | 0.191 / 0.567 / 0.975 | 50,251.26 | 0.167 / 0.383 / 0.551 |
+| PING_INLINE | 30,960 | 0.199 | 47,619 | 0.151 |
+| PING_MBULK | 30,303 | 0.207 | 47,170 | 0.159 |
+| SET | 27,174 | 0.231 | 42,553 | 0.191 |
+| GET | 29,070 | 0.207 | 42,373 | 0.191 |
+| LPUSH | 29,070 | 0.215 | 41,841 | 0.199 |
+| RPUSH | 28,249 | 0.223 | 39,683 | 0.199 |
+| LPOP | 29,240 | 0.215 | 42,918 | 0.191 |
+| RPOP | 29,586 | 0.207 | 43,290 | 0.183 |
 
-These figures are a one-off loopback smoke benchmark, not a capacity estimate,
-SLA, or production comparison. Results depend on the host, runtime, and load;
-they were not repeated to calculate confidence intervals or run to saturation.
-The native benchmark covers PING, SET/GET, and list push/pop only; it does not
-measure every implemented list command or unsupported Redis commands. It also
-does not model persistence, TLS, or network latency. `redis-benchmark` printed
-`WARNING: Could not fetch server CONFIG` because Carrot does not implement
-`CONFIG`; the selected benchmark cases still completed.
-
----
-
-## Server Architecture Comparison: When to Use Which?
-
-Carrot provides two distinct networking models. Below is a high-level architectural insight and selection guide to help you choose the right server for your deployment:
-
-### 1. Goroutine-per-Client Server (`cmd/server`)
-
-* **How it works:** Uses Go's standard `net.Listener`. Each incoming TCP connection spawns a dedicated goroutine (`go s.handleClient(conn)`). Blocking I/O reads and writes are managed transparently by the Go runtime netpoller.
-* **Pros:**
-  - **Cross-Platform Compatibility:** Runs on Linux, macOS, Windows, and BSD without OS-specific system call dependencies.
-  - **Simplicity & Debuggability:** Straightforward code paths with clean stack traces and easy profiling using standard Go tools (`pprof`).
-  - **Safety Under Long Commands:** Individual client latency spikes do not block the event loop of other clients.
-* **Cons:**
-  - **Higher Memory Overhead:** Each client connection allocates a Go goroutine stack (2KB–8KB) plus I/O buffers.
-  - **Goroutine Context Switching:** High connection counts (10,000+ connections) incur Go scheduler context switching overhead.
-* **When to use:** Local cross-platform development (macOS/Windows), debugging, or non-Linux deployment environments.
+Reproduce the comparison with `make benchmark`; the script runs three rounds
+and prints environment and parameter details. See
+[docs/TEST_EXECUTION_GUIDE.md](docs/TEST_EXECUTION_GUIDE.md) for overrides.
+Executor/storage microbenchmarks are available with
+`go test -run '^$' -bench . ./internal/command`.
+These results are a local microbenchmark, not a capacity estimate, SLA, or
+production comparison. They do not measure AOF durability, TLS, network
+latency, or every implemented/unsupported command. `redis-benchmark` reports
+that it cannot fetch `CONFIG`, which Carrot does not implement; the selected
+cases complete despite that warning.
 
 ---
 
-### 2. Linux Epoll Reactor Server (`cmd/reactor-server`)
+## Server architecture comparison
 
-* **How it works:** Implements an event-driven, single-threaded Reactor pattern using Linux `epoll_wait` system calls directly via `golang.org/x/sys/unix`. Sockets are configured as non-blocking (`SOCK_NONBLOCK`), and a single event loop thread handles connection accepting (`accept4`), buffer draining, command dispatching, and response flushing.
-* **Pros:**
-  - **Maximum Throughput & Low Latency:** Delivers **~60,000–64,000 QPS** (~1.7x higher throughput than the Goroutine server) with sub-150 microsecond median p50 latency.
-  - **Minimal Memory Overhead:** Sockets are held as raw file descriptors registered in kernel memory without per-client goroutines.
-  - **Zero CPU Waste on Idle Connections:** Scales efficiently to thousands of idle clients without goroutine wakeups.
-* **Cons:**
-  - **Linux Specific:** Requires Linux `epoll_create1`, `epoll_wait`, and `accept4` system calls (`//go:build linux`).
-  - **Single-Threaded Head-of-Line Risk:** Long-running CPU-bound commands on the event loop thread delay execution for all other connected clients.
-* **When to use:** Linux production deployments, high-throughput micro-benchmarking, ultra-low latency SLAs, and high connection density on Linux hosts.
+Carrot provides two networking models. This is an implementation comparison,
+not a production deployment recommendation.
 
----
+### Goroutine-per-client server (`cmd/server`)
 
-### Summary Comparison Matrix
+Uses Go's standard `net.Listener`, with a goroutine handling each client.
+This is the simpler and easier-to-debug implementation. The networking code
+uses Go's portable APIs, but AOF currently requires Linux and is enabled by
+default; on non-Linux systems this server must be run with
+`-aof-enabled=false`, making it ephemeral.
 
-| Feature / Criteria | Goroutine Server (`cmd/server`) | Epoll Reactor Server (`cmd/reactor-server`) |
+### Linux epoll reactor (`cmd/reactor-server`)
+
+Uses non-blocking sockets and Linux `epoll` to dispatch client readiness
+through an event loop. It avoids a goroutine per client, but commands execute
+on the event-loop path, so long operations can delay other clients. IPv4 and
+IPv6 listener addresses are supported; dual-stack behavior for an IPv6
+wildcard bind depends on OS configuration.
+
+| Property | Goroutine server | Epoll reactor |
 |---|---|---|
-| **Networking Architecture** | Goroutine-per-client (`net.Conn`) | Event Loop (`epoll_wait` system calls) |
-| **Supported OS** | Cross-platform (Linux, macOS, Windows) | Linux only (`//go:build linux`) |
-| **Peak Throughput** | **~35,000 – 37,000 QPS** | **~60,000 – 64,000 QPS** (🚀 **1.7x Faster**) |
-| **Median Latency (p50)** | **~0.16 – 0.19 ms** | **~0.11 – 0.14 ms** |
-| **Client Memory Footprint** | ~2 KB – 8 KB stack per connection | Low (raw Socket FD in kernel) |
-| **IP Protocol Support** | IPv4 & IPv6 | IPv4 & IPv6 (Dual-Stack `::`) |
-| **Recommended Use Case** | Cross-platform dev, testing & debugging | Linux production & high-throughput SLAs |
+| Networking model | Goroutine per client using `net.Conn` | Linux epoll event loop |
+| Server networking API | Go `net` package | Linux syscalls |
+| AOF platform support | Linux only | Linux only |
+| Intended role in this project | Simpler networking implementation | Event-loop implementation for comparison |
+
+Benchmark results above are local measurements with stated conditions, not
+capacity guarantees, SLAs, or production-readiness evidence.
 
 ---
 
@@ -278,7 +279,18 @@ Carrot was built to explore two concurrency models:
 1. A simple per-client goroutine server for clarity and ease of debugging
 2. A Linux epoll reactor for lower-overhead, event-driven networking
 
-Carrot is not a drop-in Redis replacement. The project goal, out-of-scope features, readiness phases, and verified test baseline are described in [docs/PROJECT_SCOPE.md](docs/PROJECT_SCOPE.md), [docs/TEST_SUMMARY.md](docs/TEST_SUMMARY.md), and [docs/TEST_EXECUTION_GUIDE.md](docs/TEST_EXECUTION_GUIDE.md).
+The repository-level architecture source of truth is
+[HLD.md](HLD.md) (system behavior and component interactions) and
+[LLD.md](LLD.md) (code structures, algorithms, and synchronization). Read
+those documents with the source; package-specific guides are supplementary.
+
+Carrot is not a drop-in Redis replacement. The project goal, out-of-scope
+features, readiness phases, and verified test baseline are described in
+[docs/PROJECT_SCOPE.md](docs/PROJECT_SCOPE.md),
+[docs/TEST_SUMMARY.md](docs/TEST_SUMMARY.md), and
+[docs/TEST_EXECUTION_GUIDE.md](docs/TEST_EXECUTION_GUIDE.md).
+Contribution and test expectations are documented in
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 
