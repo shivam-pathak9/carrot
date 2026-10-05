@@ -2,9 +2,13 @@ package aof
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -218,6 +222,123 @@ func TestAOFPeriodicSyncAndReplay(t *testing.T) {
 	defer recoveredLog.Close()
 	if got := execute(t, command.NewExecutor(recovered), "GET", "periodic"); got.Type != resp.BulkString || got.String != "synced" {
 		t.Fatalf("recovered GET = %+v", got)
+	}
+}
+
+func TestAOFRecordsMutationThatReturnsCommandError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "appendonly.aof")
+	store := storage.NewStore()
+	logFile, err := Open(path, "always", store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := command.NewExecutor(store)
+	executor.SetJournal(logFile)
+	execute(t, executor, "SET", "string-key", "value")
+
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := executor.Execute(command.Command{
+		Name: "LPUSH",
+		Args: []string{"string-key", "item"},
+	})
+	if err != nil {
+		t.Fatalf("LPUSH execution returned Go error: %v", err)
+	}
+	if response.Type != resp.Error {
+		t.Fatalf("LPUSH response = %+v, want command error", response)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Size() <= before.Size() {
+		t.Fatal("current write-ahead behavior should record the rejected mutation")
+	}
+	if err := logFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered := storage.NewStore()
+	recoveredLog, err := Open(path, "always", recovered)
+	if err != nil {
+		t.Fatalf("replay of rejected mutation failed: %v", err)
+	}
+	defer recoveredLog.Close()
+	got := execute(t, command.NewExecutor(recovered), "GET", "string-key")
+	if got.Type != resp.BulkString || got.String != "value" {
+		t.Fatalf("recovered value = %+v, want original string", got)
+	}
+}
+
+func TestAOFSubprocessCrashWriter(t *testing.T) {
+	path := os.Getenv("CARROT_AOF_CRASH_TEST_PATH")
+	if path == "" {
+		return
+	}
+	store := storage.NewStore()
+	logFile, err := Open(path, "always", store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := command.NewExecutor(store)
+	executor.SetJournal(logFile)
+	for i := 0; i < 10; i++ {
+		execute(t, executor, "SET", "crash:key:"+strconv.Itoa(i), "durable")
+	}
+	if _, err := os.Stdout.WriteString("AOF_READY\n"); err != nil {
+		t.Fatal(err)
+	}
+	select {}
+}
+
+func TestAOFRecoversAfterAbruptProcessTermination(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("AOF file locking and crash recovery test requires Linux")
+	}
+	path := filepath.Join(t.TempDir(), "appendonly.aof")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestAOFSubprocessCrashWriter$")
+	cmd.Env = append(os.Environ(), "CARROT_AOF_CRASH_TEST_PATH="+path)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	scanner := bufio.NewScanner(stdout)
+	if !scanner.Scan() || scanner.Text() != "AOF_READY" {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatalf("crash writer did not become ready: output=%q err=%v stderr=%q",
+			scanner.Text(), scanner.Err(), stderr.String())
+	}
+	if err := cmd.Process.Kill(); err != nil {
+		_ = cmd.Wait()
+		t.Fatalf("kill crash writer: %v", err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("crash writer exited normally; expected forced termination")
+	}
+
+	recovered := storage.NewStore()
+	recoveredLog, err := Open(path, "always", recovered)
+	if err != nil {
+		t.Fatalf("reopen AOF after forced termination: %v", err)
+	}
+	defer recoveredLog.Close()
+	executor := command.NewExecutor(recovered)
+	for i := 0; i < 10; i++ {
+		got := execute(t, executor, "GET", "crash:key:"+strconv.Itoa(i))
+		if got.Type != resp.BulkString || got.String != "durable" {
+			t.Fatalf("recovered key %d = %+v, want durable value", i, got)
+		}
 	}
 }
 

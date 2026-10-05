@@ -34,6 +34,38 @@ func TestMutationIsNotAppliedWhenJournalAppendFails(t *testing.T) {
 	}
 }
 
+func TestExecutorConcurrentMutationsWithoutJournal(t *testing.T) {
+	const writes = 256
+	executor := NewExecutor(storage.NewStore())
+	var wg sync.WaitGroup
+	errs := make(chan error, writes)
+	for i := 0; i < writes; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			key := fmt.Sprintf("concurrent:%d", i)
+			if _, err := executor.Execute(Command{Name: "SET", Args: []string{key, "value"}}); err != nil {
+				errs <- err
+				return
+			}
+			value, err := executor.Execute(Command{Name: "GET", Args: []string{key}})
+			if err != nil {
+				errs <- err
+				return
+			}
+			if value.Type != resp.BulkString || value.String != "value" {
+				errs <- fmt.Errorf("GET %q = %+v, want value", key, value)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+}
+
 type blockingRewriteJournal struct {
 	mu       sync.Mutex
 	events   []string

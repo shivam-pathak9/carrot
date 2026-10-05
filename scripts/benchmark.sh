@@ -7,7 +7,7 @@ BENCH_RUNS=${BENCH_RUNS:-3}
 BENCH_REQUESTS=${BENCH_REQUESTS:-10000}
 BENCH_CLIENTS=${BENCH_CLIENTS:-10}
 BENCH_DATA_SIZE=${BENCH_DATA_SIZE:-16}
-BENCH_PIPELINE=${BENCH_PIPELINE:-1}
+BENCH_PIPELINE=${BENCH_PIPELINE:-16}
 STANDARD_PORT=${STANDARD_PORT:-16379}
 REACTOR_PORT=${REACTOR_PORT:-16380}
 
@@ -49,7 +49,13 @@ echo "Date: $(date -Is)"
 echo "Host: $(uname -a)"
 echo "Go: $(go version)"
 echo "redis-benchmark: $(redis-benchmark --version)"
-echo "Runs per server: $BENCH_RUNS; requests: $BENCH_REQUESTS; clients: $BENCH_CLIENTS; payload bytes: $BENCH_DATA_SIZE; pipeline: $BENCH_PIPELINE"
+echo "Runs per server and pipeline depth: $BENCH_RUNS; requests: $BENCH_REQUESTS; clients: $BENCH_CLIENTS; payload bytes: $BENCH_DATA_SIZE"
+if [[ "$BENCH_PIPELINE" == 1 ]]; then
+	pipeline_depths=(1)
+else
+	pipeline_depths=(1 "$BENCH_PIPELINE")
+fi
+echo "Pipeline depths: ${pipeline_depths[*]}"
 echo "AOF disabled for both runs to compare network and in-memory command paths."
 
 run_server() {
@@ -83,13 +89,15 @@ run_server() {
 		return 1
 	fi
 
-	for run in $(seq 1 "$BENCH_RUNS"); do
-		echo
-		echo "=== $name run $run/$BENCH_RUNS ==="
-		redis-benchmark --csv -h 127.0.0.1 -p "$port" \
-			-n "$BENCH_REQUESTS" -c "$BENCH_CLIENTS" -d "$BENCH_DATA_SIZE" \
-			-P "$BENCH_PIPELINE" \
-			-t ping_inline,ping_mbulk,set,get,lpush,rpush,lpop,rpop
+	for pipeline in "${pipeline_depths[@]}"; do
+		for run in $(seq 1 "$BENCH_RUNS"); do
+			echo
+			echo "=== $name pipeline $pipeline run $run/$BENCH_RUNS ==="
+			redis-benchmark --csv -h 127.0.0.1 -p "$port" \
+				-n "$BENCH_REQUESTS" -c "$BENCH_CLIENTS" -d "$BENCH_DATA_SIZE" \
+				-P "$pipeline" \
+				-t ping_inline,ping_mbulk,set,get,lpush,rpush,lpop,rpop
+		done
 	done
 
 	kill -TERM "$server_pid"

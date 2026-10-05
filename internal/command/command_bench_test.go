@@ -2,6 +2,7 @@ package command
 
 import (
 	"fmt"
+	"sync/atomic"
 	"testing"
 
 	"github.com/shivam-pathak9/carrot/internal/storage"
@@ -31,6 +32,36 @@ func BenchmarkExecutorGET(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+func BenchmarkExecutorParallelSetGet(b *testing.B) {
+	const keyCount = 1 << 16
+	keys := make([]string, keyCount)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("parallel-executor-key-%d", i)
+	}
+
+	executor := NewExecutor(storage.NewStore())
+	var nextWorker atomic.Uint64
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		base := int(nextWorker.Add(1)-1) * 16
+		index := 0
+		for pb.Next() {
+			key := keys[(base+index)&(keyCount-1)]
+			if _, err := executor.Execute(Command{Name: "SET", Args: []string{key, "value"}}); err != nil {
+				b.Errorf("SET %q: %v", key, err)
+				return
+			}
+			if _, err := executor.Execute(Command{Name: "GET", Args: []string{key}}); err != nil {
+				b.Errorf("GET %q: %v", key, err)
+				return
+			}
+			index = (index + 1) & 15
+		}
+	})
 }
 
 func BenchmarkListPushAndPop(b *testing.B) {

@@ -268,29 +268,40 @@ flowchart TD
     Rewrite --> Unlock["unlock; return OK/error"]
     Special -->|no| Mut{"IsMutation(name)?"}
     Mut -->|no| Dispatch["execute handler"]
-    Mut -->|yes| Lock["writeMu.Lock"]
-    Lock --> Journal{"Journal installed?"}
-    Journal -->|yes| Append["Append canonical command"]
+    Mut -->|yes| Journal{"Journal installed?"}
+    Journal -->|yes| Lock["writeMu.Lock"]
+    Lock --> Append["Append canonical command"]
     Journal -->|no| Dispatch
     Append --> Good{"append succeeded?"}
     Good -->|no| Error["return Go error; do not mutate"]
     Good -->|yes| Canonical["replace request with persisted command"]
     Canonical --> Dispatch
-    Dispatch --> Unlock
-    Dispatch --> Response["RESP value + optional error"]
+    Dispatch --> LockHeld{"writeMu held?"}
+    LockHeld -->|yes| Unlock["unlock writeMu"]
+    LockHeld -->|no| Response["RESP value + optional error"]
+    Unlock --> Response
 ```
 
-Each server has one shared executor/store per process. `writeMu` serializes
-mutations across clients across append and in-memory execution. This preserves
-the order between durable commands and resulting state. Reads do not acquire
-that executor mutex and may proceed concurrently, subject to the store's shard
-locks. The standard server can therefore execute independent client goroutines
-concurrently; the reactor has one event-loop command-dispatch path, with the
-same executor/storage semantics.
+Each server has one shared executor/store per process. When a journal is
+installed, `writeMu` serializes mutations across append and in-memory
+execution. This preserves the order between durable commands and resulting
+state and prevents writes during a rewrite snapshot. Without a journal,
+mutations rely on storage shard locks and can proceed concurrently for
+different shards. Reads also rely on shard locks. The standard server runs
+client handlers in separate goroutines; the reactor has one event-loop
+command-dispatch path and therefore processes commands sequentially regardless
+of AOF.
 
 If persistence append fails, the executor returns before applying the
 mutation. With AOF disabled, the same command handlers still execute, but
 there is no restart durability.
+
+In the reactor, command dispatch is synchronous on the event-loop path. A
+mutation using `always` can block that loop during `file.Sync`; synchronous
+`AOFREWRITE` blocks it for the full rewrite. Other ready clients cannot be
+processed until the operation returns. The standard server's other client
+goroutines can continue to run, although journaled mutations queue on
+`writeMu`.
 
 `AOFREWRITE` holds the same mutation mutex for the complete synchronous
 rewrite. Mutations wait. In the standard goroutine server, read handlers can
@@ -304,8 +315,11 @@ and then update memory.
 The in-memory store has 256 fixed shards. Each shard has a `sync.RWMutex` and
 a Go map from key to typed object. FNV-1a hashes a key to one shard. The
 documented intent is lock striping to allow unrelated keys to be accessed
-under different locks. The count is a constant in code; no workload-specific
-comparison of shard counts is implemented, so 256 is not claimed as optimal.
+under different locks at the storage layer. Executor mutations without AOF
+can use this concurrency; when a journal is installed, `writeMu` serializes
+mutations to preserve journal order and rewrite consistency. The count is a
+constant in code; no workload-specific comparison of shard counts is
+implemented, so 256 is not claimed as optimal.
 
 Current value kinds are string and list. Expiration is stored as an absolute
 `time.Time` deadline. Access methods perform passive expiration: an expired
@@ -406,15 +420,16 @@ experimental proof that the choice is optimal.
 |---|---|---|---|
 | Two server modes | Go `net.Listener` server and Linux epoll reactor share parser, executor, store, and journal | Allows comparison of blocking per-connection I/O and readiness-driven I/O while keeping command semantics shared | More transport/lifecycle code to maintain. Local comparison exists, but cannot establish that either model is universally faster or production-preferable. |
 | Standard connection handling | One handler goroutine per accepted `net.Conn` | Keeps each connection's blocking read/decode/execute/write flow isolated and uses Go's standard networking API | Goroutines and connection state grow with client count; max connections is configured, but total process memory is not. TCP tests exist; high-connection scalability is not proven. |
-| Reactor execution | One event-loop path owns socket readiness, connection buffers, and command dispatch | Makes non-blocking reads, partial writes, and readiness transitions explicit | Slow command/rewrite work delays every ready connection on that loop. No workload evidence proves a general latency or throughput advantage. |
+| Reactor execution | One event-loop path owns socket readiness, connection buffers, and synchronous command dispatch | Makes non-blocking reads, partial writes, and readiness transitions explicit | Slow commands, `always` AOF sync, and synchronous rewrite delay every ready connection on that loop. No workload evidence proves a general latency or throughput advantage. |
 | Shared command core | Both transports use the same parser and executor | Avoids implementing command semantics twice | Transport-specific error, buffering, and timeout behavior still differ. Integration tests cover both paths. |
 | RESP request shape | Commands are arrays of bulk strings, normalized to `Command{Name, Args}` | Gives handlers a transport-independent representation and supports binary bulk arguments | It is a deliberately narrow subset, not complete Redis compatibility. Protocol tests validate implemented framing, not compatibility with every Redis client/command. |
 | Live state and persistence | In-memory typed store plus append-only command log replayed at startup | Keeps normal command execution in process while preserving a sequential recovery mechanism | Store memory is unbounded and replay duration grows with log size. Streaming replay avoids a whole-file allocation; there is no large-file benchmark or physical power-loss test matrix. |
 | Append-before-apply | Recognized mutations are serialized, journaled, then applied | A known append failure is returned before changing live state; the same order establishes journal/state ordering | A single write mutex serializes even unrelated-key mutations. Tests cover append failure and ordering; contention cost is not quantified for all policies. |
+| Rejected command logging | A syntactically canonicalizable mutation is journaled before its handler runs, including commands that return RESP errors such as wrong-type list operations | Preserves append-before-apply without needing a separate validation/commit path | Rejected requests add AOF bytes but replay to the same data state. Safely excluding them requires an atomic command validation/commit design; executing first could leave unpersisted memory changes after an append failure. A regression test covers current behavior. |
 | AOF sync policies | `always`, `everysec`, and `no`; default is `everysec` | Exposes an explicit durability/performance tradeoff | Acknowledged-write loss windows depend on policy and OS/filesystem/device behavior. Tests verify code paths, not hardware power-loss guarantees. |
 | Synchronous rewrite | A mutation barrier protects a snapshot written to a same-directory temporary file and atomically renamed | Avoids a concurrent-write buffer and merge protocol; mutation order stays unambiguous | Mutations pause; the reactor cannot serve requests during rewrite, while standard-server reads can proceed. Correctness/failure tests exist; sustained-load impact is unmeasured. |
-| Sharded store | 256 fixed FNV-1a-routed shards, each with an `RWMutex` and map | Lock striping lets operations on keys in different shards avoid contending on one global lock | Hash collisions serialize unrelated keys; there is overhead per shard. No alternative-count benchmark proves 256 optimal. The central limit theorem is not a justification for this constant. |
-| Expiration | Passive expiration on access plus sampled active sweeps | Access-time checks provide correct behavior for touched keys; sweeps reclaim expired keys not touched again | Cleanup is eventual and sampled, not a deadline guarantee. The cycle has explicit sample/iteration/time limits; tests cover semantics, not all key distributions. |
+| Sharded store | 256 fixed FNV-1a-routed shards, each with an `RWMutex` and map | Storage calls and executor mutations without AOF can proceed concurrently when they target different shards | With AOF enabled, `Executor.writeMu` serializes mutations for journal ordering and rewrite consistency. Hash collisions serialize unrelated keys; there is overhead per shard. No alternative-count benchmark proves 256 optimal. The central limit theorem is not a justification for this constant. |
+| Expiration | Passive expiration on access plus sampled active sweeps | Access-time checks provide correct behavior for touched keys; sweeps reclaim expired keys not touched again | The sweep visits Go map entries in unspecified iteration order; it is not uniform random sampling and is eventual, not immediate. It returns a deletion count but server callers currently discard it; cleanup logs are aggregated at most once per minute per store. Tests cover expiration and log throttling, not all key distributions. |
 | Resource bounds | Limits apply to connections, messages, protocol fields, responses, and timeouts | Bounds specific, attacker-controlled input paths and limits slow/stalled connections | They do not cap aggregate memory, database size, or disk use. Boundary tests exist; total-memory exhaustion is not demonstrated safe. |
 | Bind default | Default listener is `0.0.0.0:6379`; wildcard startup is warned | Retains an all-interface default for the server's current configuration behavior | There is no authentication or TLS, so the default is unsafe on untrusted networks. Use loopback/firewalling for local or controlled deployment; a warning is not access control. |
 | Linux-specific AOF | Linux file locking and directory-sync operations; non-Linux AOF open fails explicitly | Makes unsupported durability behavior fail clearly instead of silently weakening it | AOF-enabled operation is Linux-specific. The repository validates its Linux path; it does not claim portable AOF semantics. |

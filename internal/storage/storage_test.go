@@ -1,7 +1,10 @@
 package storage
 
 import (
+	"bytes"
 	"fmt"
+	"log"
+	"strings"
 	"testing"
 	"time"
 )
@@ -534,6 +537,7 @@ func TestActiveExpireCycleStopsBelowThreshold(t *testing.T) {
 			store.setRawObj(key, Obj{Value: "expired", ExpiresAt: time.Now().Add(-1 * time.Second)})
 			continue
 		}
+
 		store.setRawObj(key, Obj{Value: fmt.Sprintf("live-%d", i), ExpiresAt: time.Now().Add(5 * time.Second)})
 	}
 
@@ -562,5 +566,29 @@ func TestExpireOnExpiredKeyReturnsFalse(t *testing.T) {
 	}
 	if _, exists := store.getRawObj("stale"); exists {
 		t.Fatal("Expire should remove an already expired key from the store")
+	}
+}
+
+func TestActiveExpirationLogsAreRateLimitedAndAggregated(t *testing.T) {
+	var output bytes.Buffer
+	original := log.Writer()
+	log.SetOutput(&output)
+	defer log.SetOutput(original)
+
+	store := NewStore()
+	store.reportActiveExpiration(3)
+	store.reportActiveExpiration(2)
+	store.expirationLogMu.Lock()
+	store.lastExpirationLog = time.Now().Add(-2 * activeExpirationLogInterval)
+	store.expirationLogMu.Unlock()
+	store.reportActiveExpiration(0)
+
+	got := output.String()
+	if strings.Count(got, "[Active Expire]") != 2 {
+		t.Fatalf("expected two aggregated reports, got %q", got)
+	}
+	if !strings.Contains(got, "Cleaned 3 expired key(s)") ||
+		!strings.Contains(got, "Cleaned 2 expired key(s)") {
+		t.Fatalf("reports do not contain expected aggregated counts: %q", got)
 	}
 }

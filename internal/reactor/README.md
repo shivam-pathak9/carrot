@@ -16,10 +16,14 @@ measurements.
 
 ### Per-Client Goroutine vs. Reactor Architecture
 
-| Architecture | Model | Concurrency Unit | Memory Overhead | Use Case |
-| :--- | :--- | :--- | :--- | :--- |
-| **Per-Client Goroutine** (`internal/server`) | 1 Goroutine per Connection | Go Runtime Scheduler | ~2KB to 8KB per stack | Simple, thread-per-conn simplicity |
-| **Reactor Event Loop** (`internal/reactor`) | 1 Thread / Event Loop | System File Descriptors | Minimal (Shared event buffer) | High concurrency (C10K/C1000K), zero context switching |
+| Architecture | Model | Execution path | Tradeoff |
+| :--- | :--- | :--- | :--- |
+| **Per-Client Goroutine** (`internal/server`) | One goroutine per connection | Blocking I/O through Go `net.Conn`; handlers can run concurrently | Straightforward connection isolation, with per-connection goroutine and buffer costs |
+| **Reactor Event Loop** (`internal/reactor`) | One event loop for all connections | Non-blocking socket I/O and command execution on one loop | Avoids a goroutine per connection, but a slow command, `always` AOF sync, or synchronous `AOFREWRITE` blocks processing for all connections |
+
+The reactor is an alternative I/O model, not a guarantee of C10K-scale
+capacity or lower latency. The repository's local benchmarks do not establish
+those properties, and command execution remains synchronous on the event loop.
 
 ---
 

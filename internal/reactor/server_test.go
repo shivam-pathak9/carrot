@@ -193,6 +193,14 @@ func TestReactorStopsAndClosesIdleClients(t *testing.T) {
 }
 
 func TestReactorIPv6Binding(t *testing.T) {
+	probe, err := net.Listen("tcp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("IPv6 loopback is unavailable: %v", err)
+	}
+	if err := probe.Close(); err != nil {
+		t.Fatalf("close IPv6 availability probe: %v", err)
+	}
+
 	cfg := config.DefaultConfig()
 	cfg.Host = "::1"
 	cfg.Port = "0"
@@ -200,8 +208,7 @@ func TestReactorIPv6Binding(t *testing.T) {
 	srv, _ := startTestReactor(t, cfg)
 	conn, err := net.Dial("tcp", srv.Addr().String())
 	if err != nil {
-		t.Skipf("IPv6 loopback dial failed (system may lack IPv6): %v", err)
-		return
+		t.Fatalf("IPv6 loopback probe succeeded but reactor dial failed: %v", err)
 	}
 
 	defer conn.Close()

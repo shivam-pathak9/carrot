@@ -200,42 +200,81 @@ The project currently demonstrates:
 
 Important gaps before production use still include:
 
-- Crash/fault-injection validation and backup procedures
+- OS/power-loss and disk-failure injection beyond the server-process SIGKILL
+  recovery harness, plus backup procedures
 - Authentication, transport security, and a safer default bind policy
 - Total database memory quotas, metrics, health checks, and deployment guidance
 - Hashes, sets, sorted sets, and blocking list commands
 
-## Local benchmark
+## Local benchmarks
 
-The following repeatable local comparison was run on 2026-10-03 with
-`redis-benchmark 7.0.15`, Go 1.26.4, on WSL2 Linux/amd64 (`12` logical CPUs,
-kernel `6.18.33.2-microsoft-standard-WSL2`). Both servers bound to loopback;
-AOF was disabled to compare the network and in-memory command paths. Each of
-three rounds sent 10,000 requests per command with 10 concurrent clients, a
-16-byte payload, and pipeline depth 1. The table reports median throughput and
-median p50 latency across those three runs:
+The following loopback comparison was run on 2026-10-04 with
+`redis-benchmark 7.0.15`, Go 1.26.4, on WSL2 Linux/amd64 (12 logical CPUs,
+kernel `6.18.33.2-microsoft-standard-WSL2`). AOF was disabled. Each of three
+runs sent 10,000 requests per command with 10 clients and a 16-byte payload.
+Numbers below are medians of the three reported throughputs; these are
+observations on this host, not a general ranking of the two server designs.
 
-| Command | Goroutine req/s | Goroutine p50 (ms) | Reactor req/s | Reactor p50 (ms) |
-|---|---:|---:|---:|---:|
-| PING_INLINE | 30,960 | 0.199 | 47,619 | 0.151 |
-| PING_MBULK | 30,303 | 0.207 | 47,170 | 0.159 |
-| SET | 27,174 | 0.231 | 42,553 | 0.191 |
-| GET | 29,070 | 0.207 | 42,373 | 0.191 |
-| LPUSH | 29,070 | 0.215 | 41,841 | 0.199 |
-| RPUSH | 28,249 | 0.223 | 39,683 | 0.199 |
-| LPOP | 29,240 | 0.215 | 42,918 | 0.191 |
-| RPOP | 29,586 | 0.207 | 43,290 | 0.183 |
+### Pipeline depth 1
 
-Reproduce the comparison with `make benchmark`; the script runs three rounds
-and prints environment and parameter details. See
-[docs/TEST_EXECUTION_GUIDE.md](docs/TEST_EXECUTION_GUIDE.md) for overrides.
-Executor/storage microbenchmarks are available with
-`go test -run '^$' -bench . ./internal/command`.
-These results are a local microbenchmark, not a capacity estimate, SLA, or
-production comparison. They do not measure AOF durability, TLS, network
-latency, or every implemented/unsupported command. `redis-benchmark` reports
+| Command | Goroutine req/s | Reactor req/s |
+|---|---:|---:|
+| PING_INLINE | 28,736 | 44,053 |
+| PING_MBULK | 28,169 | 46,083 |
+| SET | 28,653 | 42,918 |
+| GET | 28,011 | 42,735 |
+| LPUSH | 25,907 | 36,101 |
+| RPUSH | 24,331 | 35,461 |
+| LPOP | — | 35,971 |
+| RPOP | 26,596 | 36,232 |
+
+### Pipeline depth 16
+
+| Command | Goroutine req/s | Reactor req/s |
+|---|---:|---:|
+| PING_INLINE | 113,636 | 175,439 |
+| PING_MBULK | 114,943 | 161,290 |
+| SET | 108,696 | 125,000 |
+| GET | 100,000 | 128,205 |
+| LPUSH | 100,000 | 129,870 |
+| RPUSH | 93,458 | 111,111 |
+| LPOP | 97,087 | 109,890 |
+| RPOP | 100,000 | 114,943 |
+
+One of the three standard-server pipeline-1 `LPOP` runs returned a negative
+throughput value from `redis-benchmark` despite reporting ordinary latency.
+That result is invalid and is omitted rather than presented as a measurement;
+the other two runs were positive. This is a reminder that benchmark output
+needs sanity checks, not just aggregation.
+
+For a direct storage-level parallel measurement, this host reported
+`BenchmarkStoreParallelSetGet` at 53.11, 60.45, and 58.33 ns/op (median
+58.33 ns/op; 0 allocations/op). One benchmark operation is a `Set` followed
+by a `GetString`, running directly against `Store` with `b.RunParallel`.
+It bypasses `Executor.writeMu`, compares only the current 256-shard
+implementation, and is not evidence that command mutations execute in
+parallel or that 256 shards is optimal.
+
+The AOF-disabled `BenchmarkExecutorParallelSetGet` measured 135.0, 130.9,
+and 129.0 ns/op (median 130.9 ns/op; 48 B/op and 2 allocations/op). Each
+iteration executes `SET` then `GET` through `Executor` on a worker-selected
+key. With no journal, executor mutations rely on shard locks and do not take
+the journal-ordering mutex. This is an in-process microbenchmark, not a
+network benchmark or an AOF-enabled contention measurement.
+
+Reproduce the network comparison with `make benchmark`; by default it runs
+pipeline depths 1 and 16, three times each, and prints environment and
+parameter details. Set `BENCH_PIPELINE=1` to run only depth 1, or set it to
+another positive depth to run depth 1 and that depth. See
+[docs/TEST_EXECUTION_GUIDE.md](docs/TEST_EXECUTION_GUIDE.md) for further
+overrides. Reproduce the store benchmark with
+`go test -run '^$' -bench '^BenchmarkStoreParallelSetGet$' -benchtime=3s -count=3 ./internal/storage`.
+
+These local microbenchmarks are not capacity estimates, SLAs, or production
+comparisons. They do not measure AOF durability, TLS, external network
+latency, or every implemented/unsupported command. `redis-benchmark` warns
 that it cannot fetch `CONFIG`, which Carrot does not implement; the selected
-cases complete despite that warning.
+cases completed despite that warning.
 
 ---
 

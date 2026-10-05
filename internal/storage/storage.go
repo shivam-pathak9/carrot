@@ -7,6 +7,8 @@ import (
 	"time"
 )
 
+const activeExpirationLogInterval = time.Minute
+
 // Obj represents a typed entry stored inside the in-memory storage engine.
 type Obj struct {
 	Value     string
@@ -50,25 +52,15 @@ type shard struct {
 	data map[string]Obj
 }
 
-// Store is the in-memory typed key-value database used by Carrot.
-//
-// DESIGN DECISION: LOCK STRIPING / SHARDING FOR MULTI-CORE SCALABILITY
-// ------------------------------------------------------------------
-// Issue & Motivation:
-// A single global sync.RWMutex guarding a single map[string]Obj creates severe lock contention
-// under high concurrent read/write throughput on multi-core CPUs. Every concurrent operation
-// (SET, GET, DEL, LPUSH, etc.) contends for the same single lock instance.
-//
-// Solution:
-// Store partitions the key space into 256 independent shards (shards [256]shard).
-// Each shard owns an independent RWMutex and map[string]Obj. Keys are mapped to shards using
-// the FNV-1a hash algorithm: shardIndex = fnv32a(key) % 256.
-//
-// Benefits:
-// 1. Concurrent operations targeting different keys execute in parallel across CPU cores without blocking.
-// 2. Background Active Expiration sweeps lock single shards briefly instead of locking the entire database.
+// Store is the in-memory typed key-value database used by Carrot. Its shard
+// locks allow independent storage calls on different shards to proceed
+// concurrently. The command Executor uses an additional global mutation lock
+// only when a journal is installed to preserve persistence ordering.
 type Store struct {
-	shards [numShards]shard
+	shards            [numShards]shard
+	expirationLogMu   sync.Mutex
+	lastExpirationLog time.Time
+	pendingExpired    int
 }
 
 // fnv32a hashes a string key into a 32-bit unsigned integer using FNV-1a.
@@ -254,12 +246,14 @@ func (s *Store) ExpireAt(key string, expiresAt time.Time) bool {
 }
 
 // ActiveExpireCycle does a bounded cleanup pass for expired volatile keys.
-//
-// It iterates across shards, acquiring a lock on one shard at a time to sample volatile entries.
-// This ensures background expiration sweeps never block client requests targeting other shards.
+// It visits Go map entries in iteration order, taking one shard lock at a
+// time. Go map iteration order is unspecified; this is a bounded scan sample,
+// not a uniform random sample. The time limit is cooperative rather than a
+// hard upper bound on elapsed time. Cleanup counts are logged at most once per
+// minute per Store, with counts aggregated between reports.
 func (s *Store) ActiveExpireCycle() int {
 	const (
-		sampleSize     = 20                    // Number of volatile keys sampled per iteration
+		sampleSize     = 20                    // Maximum volatile keys visited per iteration
 		thresholdRatio = 0.25                  // 25% counter-limit threshold ratio (5 / 20)
 		maxIterations  = 16                    // Maximum loop iterations per tick
 		maxDuration    = 25 * time.Millisecond // Hard CPU latency cap per cycle
@@ -322,11 +316,25 @@ func (s *Store) ActiveExpireCycle() int {
 		}
 	}
 
-	if totalDeleted > 0 {
-		log.Printf("[Active Expire] Cleaned %d expired key(s) from memory", totalDeleted)
-	}
-
+	s.reportActiveExpiration(totalDeleted)
 	return totalDeleted
+}
+
+func (s *Store) reportActiveExpiration(deleted int) {
+	s.expirationLogMu.Lock()
+	s.pendingExpired += deleted
+	now := time.Now()
+	if s.pendingExpired == 0 ||
+		(!s.lastExpirationLog.IsZero() && now.Sub(s.lastExpirationLog) < activeExpirationLogInterval) {
+		s.expirationLogMu.Unlock()
+		return
+	}
+	reported := s.pendingExpired
+	s.pendingExpired = 0
+	s.lastExpirationLog = now
+	s.expirationLogMu.Unlock()
+
+	log.Printf("[Active Expire] Cleaned %d expired key(s) since last report", reported)
 }
 
 // ForEachSnapshot visits every currently live key without copying the entire

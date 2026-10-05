@@ -33,6 +33,9 @@ jobs:
       - name: Test
         run: go test ./...
 
+      - name: Fuzz RESP decoder
+        run: go test ./internal/protocol/resp -run '^$' -fuzz '^FuzzDecoderDoesNotPanic$' -fuzztime=5s
+
       - name: Race tests
         run: go test -race ./...
 

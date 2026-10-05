@@ -91,7 +91,10 @@ sequenceDiagram
 
 ## Detailed Data Structure Layouts
 
-The memory model is designed for zero context-switching and $\mathcal{O}(1)$ lookup performance:
+The reactor avoids creating one goroutine per connection, but it still runs
+on Go runtime threads and may block in command execution or persistence. The
+connection map provides expected constant-time descriptor lookup; neither
+zero context switching nor a latency/capacity guarantee is implied.
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐

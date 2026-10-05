@@ -240,10 +240,17 @@ command grammar are validated in handlers rather than the parser.
 
 `Executor` contains a pointer to the shared `Store`, an optional `Journal`,
 and a `writeMu`. `Execute` handles `AOFREWRITE` specially; for mutations it
-holds `writeMu` across journal append and handler execution. A successful
+holds `writeMu` across journal append and handler execution when a journal is
+configured. Without a journal, it relies on storage shard locks. A successful
 append may return a canonical command; the executor dispatches that returned
 command so the in-memory deadline matches the persisted deadline. If append
 fails, it returns a Go error before calling the handler.
+
+The journaled path holds the mutex because append and mutation must remain in
+one total order and the rewrite barrier must exclude mutations from its
+snapshot. When no journal is configured, there is no log ordering to preserve;
+each storage method provides its own shard locking, including sorted locking
+for cross-shard list moves.
 
 `execute` dispatches commands:
 
@@ -320,11 +327,14 @@ Store.shards[index]
 
 The implementation uses 256 as a fixed lock-striping count. Code comments
 state the intent: spread independent key operations over independent locks
-and keep expiration sweeps scoped to one shard at a time. The repository does
-not contain a benchmark that compares 64, 128, 256, or 1,024 shards, nor does
-it justify 256 using CPU count, workload cardinality, or measured contention.
-It is therefore an implementation choice, not an empirically selected
-optimum.
+and keep expiration sweeps scoped to one shard at a time. However,
+`Executor.Execute` serializes mutations with `writeMu` only when a journal is
+configured. With AOF disabled, sharded storage locking permits independent
+command mutations to proceed concurrently when they target different shards.
+The repository does not contain a benchmark
+that compares 64, 128, 256, or 1,024 shards, nor does it justify 256 using
+CPU count, workload cardinality, or measured contention. It is therefore an
+implementation choice, not an empirically selected optimum.
 
 The central limit theorem is not used by this code and does not establish an
 optimal shard count. It concerns distributions of sample means under
@@ -372,7 +382,11 @@ an absent/already-expired key returns false.
 ### Active expiration
 
 `ActiveExpireCycle` works shard by shard with one shard write lock held at a
-time. Current limits in the method are:
+time. It visits map entries in Go's unspecified iteration order, not through
+a uniform random sampling algorithm. It returns the number deleted; current
+server callers discard that count. Cleanup counts are aggregated and logged
+at most once per minute per store rather than logging each pass. Current
+limits in the method are:
 
 - 20 volatile entries sampled per iteration.
 - At most 16 iterations.
@@ -382,11 +396,11 @@ time. Current limits in the method are:
 
 The implementation iterates Go map entries until the sample is filled; it
 does not maintain a dedicated expiration heap or random sampling index. Map
-iteration is not an exact global scan, so one pass does not promise that every
-expired key is found. Repeated calls are needed for eventual cleanup of
-unaccessed expired keys. The elapsed-time check is cooperative; lock
-acquisition, scheduler pauses, and runtime work mean it is not a hard
-real-time upper bound.
+iteration order is unspecified and does not guarantee statistically uniform
+selection. One pass does not promise that every expired key is found.
+Repeated calls are needed for eventual cleanup of unaccessed expired keys.
+The elapsed-time check is cooperative; lock acquisition, scheduler pauses,
+and runtime work mean it is not a hard real-time upper bound.
 
 The standard server invokes it on a 100 ms ticker. The reactor invokes it
 after event dispatch in each loop, which normally wakes at least every 100 ms
@@ -483,7 +497,7 @@ allocation-free.
 
 | Lock / owner | Protects | Held across I/O? | Reason / effect |
 |---|---|---|---|
-| `Executor.writeMu` | Mutation ordering and rewrite barrier | Yes, across AOF append/rewrite | Persisted order must match state mutation order; writes pause for synchronous rewrite |
+| `Executor.writeMu` | Journaled mutation ordering and rewrite barrier | Yes, across AOF append/rewrite; not used for mutations without a journal | Persisted order must match state mutation order; writes pause for synchronous rewrite |
 | `shard.mu` (`RWMutex`) | One shard map and contained object/list | No disk/network I/O | Prevent races while preserving parallelism across shards |
 | `Log.mu` | AOF file/writer state, sync, close, failure status | Yes, file operations | Serialize append, periodic sync, rewrite handoff, and close |
 | `Server.mu` | Standard server listener/state/active connection set | Not during normal handler I/O | Coordinate accept, shutdown, and client registry |
@@ -729,7 +743,12 @@ buffered writer, and for `always` calls `file.Sync` before returning. The
 executor applies the returned command only after `Append` succeeds. A command
 that is semantically a no-op or returns a command-level error may still be
 recorded if it is syntactically canonicalizable; replay reaches the same
-handler behavior.
+handler behavior. For example, `LPUSH` against a string key is recorded
+before the handler returns WRONGTYPE. This does not change recovered data,
+but repeated rejected requests grow the AOF until rewrite. Avoiding those
+records safely requires separating validation from mutation while preserving
+append-before-apply ordering; simply executing first could change memory when
+a later append fails.
 
 ### Rollback after append failure
 
@@ -876,15 +895,16 @@ out explicitly rather than filled with assumed rationale.
 | Protocol caps | Decoder defaults include 2 MiB message, 16 KiB line, 1 MiB bulk, 1,024 array elements, and depth 64; server configuration also caps request/response bytes. | These constrain individual protocol paths but not total memory across clients or stored keys. | Limit and malformed-input tests exercise boundaries; aggregate resource exhaustion is not demonstrated safe. |
 | Fully encode responses before sending | Standard server bounds the complete response before socket write; reactor bounds its pending output buffer. | A response exceeding the cap fails rather than streaming a partial response; buffering consumes memory up to the configured limit. | Tests cover limits and output handling; no aggregate-memory quota follows from per-response caps. |
 | Command errors vs Go errors | Redis-visible command errors are RESP error values; transport/persistence failures are Go errors and terminate or interrupt processing. This keeps expected command outcomes distinct from execution failures. | Callers must preserve this distinction at each transport boundary. | Handler and network tests exercise representative errors; not every external client interpretation is tested. |
-| Global `Executor.writeMu` | One mutex covers mutation append plus in-memory apply, and the complete AOF rewrite. It ensures mutations have one total order shared by log and store and keeps the rewrite snapshot stable against writes. | Writes to unrelated keys serialize even though storage is sharded. Synchronous rewrite adds a write pause. | Ordering, rewrite concurrency, and race tests exist. There is no comprehensive contention benchmark quantifying the cost. |
+| Global `Executor.writeMu` | When a journal is configured, one mutex covers mutation append plus in-memory apply and the complete AOF rewrite. It ensures mutations have one total order shared by log and store and keeps the rewrite snapshot stable against writes. | Journaled writes to unrelated keys serialize even though storage is sharded. With no journal the mutex is bypassed and per-shard storage locks govern writes. Synchronous rewrite adds a write pause. | Ordering, rewrite concurrency, race tests, and AOF-disabled parallel executor benchmark exist. Journaled contention cost is not comprehensively measured. |
 | Append before apply | For a classified mutation, canonical AOF append must succeed before its handler changes memory. A failed append therefore does not apply that mutation. | With AOF enabled, disk errors directly affect write availability; the ordering does not make an unsynced append power-loss durable. | Tests cover append failure and canonical-command application. Durability still depends on configured sync policy and the underlying system. |
 | Central mutation classification | `command.IsMutation` is shared by executor ordering and AOF replay validation, avoiding independent command lists that can drift. | Adding a command requires updating the shared classification and canonicalizer/handler paths consistently. | Test verifies currently classified mutations can be canonicalized. It does not prove every future command is classified correctly without that test being extended. |
-| 256 shards and FNV-1a | A fixed 256-element shard array routes `hash(key) % 256`; each shard owns one map and `RWMutex`. This is lock striping: operations on different shards need not take one global store lock. | Same-shard keys contend; hash distribution and shard count affect contention; each shard adds fixed lock/map overhead. | Storage tests and race detector check exercised correctness. There is no workload-specific shard-count comparison. The central limit theorem does not justify 256. |
+| 256 shards and FNV-1a | A fixed 256-element shard array routes `hash(key) % 256`; each shard owns one map and `RWMutex`. Storage and AOF-disabled executor calls on different shards need not take one global store lock. | Same-shard keys contend; hash distribution and shard count affect contention; each shard adds fixed lock/map overhead. AOF-enabled mutations remain globally serialized for journal consistency. | Direct-store and AOF-disabled parallel executor benchmarks measure the fixed 256-shard configuration; there is no unsharded baseline or shard-count comparison. The central limit theorem does not justify 256. |
 | `RWMutex` per shard | Read paths can share a shard read lock; mutation, active expiry deletion, and lazy deletion use exclusive access to the map/value. | `RWMutex` has coordination overhead and can behave differently under write-heavy contention; it is not proven faster than `Mutex` here. | Correctness tests/race detector exist; no lock-type benchmark determines an optimal primitive. |
 | Sorted cross-shard lock order | Multi-key `ListMove` acquires source/destination locks by ascending shard index and releases in reverse order. This prevents two opposite moves from acquiring the same locks in conflicting orders. | Requires a special multi-shard path and careful same-shard handling. | Tests cover list move behavior and race checking. Deadlock freedom is reasoned from the global order, not established by finite tests alone. |
 | Mutable list under shard lock | List values are mutable circular buffers, and callers access them only while holding the owning shard lock. | A long range/scan holds the shard lock and blocks same-shard operations. | Storage tests and race detector cover exercised operations; no contention/long-range latency characterization exists. |
 | Ring buffer capacity and growth | List starts with capacity 8, wraps head/tail indices, and doubles capacity when full; end push/pop are O(1) amortized, while interior shifts/scans are O(n). | Growth temporarily allocates a larger backing slice; fixed initial capacity is a heuristic and repeated arbitrary removals may be O(n²). | Unit tests cover wrap/grow/order; selected command benchmarks cover list operations. No benchmark compares alternative initial capacities or representations. |
-| Passive plus active expiration | Accessors check absolute deadlines and lazily delete expired values. A periodic `ActiveExpireCycle` samples volatile keys (20), runs up to 16 iterations, and stops when sample expiry ratio is at most 25% or the cooperative 25 ms budget is reached. | Unaccessed expired keys can remain until sampled; sampling does not promise immediate cleanup. The 25 ms check is cooperative, not a hard deadline. | TTL/expiration tests cover semantics; there is no expiry latency/distribution benchmark or heap-based comparison. |
+| Passive plus active expiration | Accessors check absolute deadlines and lazily delete expired values. A periodic `ActiveExpireCycle` visits volatile keys in Go map iteration order (up to 20 per iteration), runs up to 16 iterations, and stops when sample expiry ratio is at most 25% or the cooperative 25 ms budget is reached. | Map order is unspecified, not uniformly random; unaccessed expired keys can remain until sampled. The 25 ms check is cooperative, not a hard deadline. Cleanup logs are aggregated at most once per minute per store; current server callers discard the returned deletion count. | TTL/expiration and log-throttling tests cover behavior; there is no expiry latency/distribution benchmark or heap-based comparison. |
+| Rejected mutation AOF records | Syntactically canonicalizable mutations are appended before execution, even if execution returns a RESP error. | Rejected requests can grow the AOF, although replay preserves the data state. Filtering them safely requires a validation/commit protocol; execute-then-append risks memory changes after an append failure. | A test demonstrates that wrong-type `LPUSH` is journaled and replay leaves the original string intact. No command-level validation/commit protocol exists. |
 | Active cycle lock scope | The sweeper locks one shard at a time so it does not hold every store lock during a pass. | A sampled scan still blocks operations targeting the shard currently locked; Go map iteration order is unspecified. | Tests cover deletion outcomes; worst-case pause and fairness are not measured. |
 | Snapshot callback outside lock | `ForEachSnapshot` copies key names per shard and one value/list at a time, unlocks, then calls the serializer. The outer executor write barrier gives a stable mutation view without holding shard locks over disk I/O. | Snapshot uses temporary per-shard key slices and assumes callers provide the mutation barrier when they need a point-in-time snapshot. | Rewrite correctness/failure tests exist. Memory is not independent of the number of keys in one shard, and no huge-dataset rewrite benchmark is recorded. |
 | AOF record format | Each mutation and rewrite record is a RESP command, so the existing decoder/parser/command handlers can replay it. | Log size includes command framing; format compatibility must be preserved when command semantics evolve. | Append/replay tests cover supported operations. No cross-version migration or format-version negotiation exists. |
@@ -897,7 +917,7 @@ out explicitly rather than filled with assumed rationale.
 | One list element per rewrite record | Lists are serialized as repeated `RPUSH` records, followed by absolute expiration when needed. | Avoids generating one unbounded list command, but creates more records and replay work for large lists. | Record-size and rewrite tests cover bounded encoding; no comparative packed/list serialization benchmark exists. |
 | AOF record size 4 MiB | Replay and rewrite use bounded records and reject oversized individual commands. | A single otherwise valid large value may be rejected for persistence/rewrite even if protocol limits differ; total AOF size remains unbounded. | Boundary tests exist; total disk quota is not implemented. |
 | Default bind and configuration | Defaults bind `0.0.0.0:6379`, enable AOF with `everysec`, cap connections at 128, request at 2 MiB, response at 4 MiB, read timeout at 30 s, write timeout at 10 s. Wildcard startup warns. | The wildcard bind exposes the listener on interfaces; no auth/TLS is implemented. Numeric defaults are not derived from a tuning study. | Validation tests check invalid values and startup warning behavior; defaults are not a security policy or capacity guarantee. |
-| Local network benchmark | Repeatable `redis-benchmark` runs bind loopback and disable AOF; in-process Go benchmarks separately exercise executor/storage paths. | The two benchmark families measure different costs and omit durable write performance in the network comparison. | Useful for repeatable local comparison only, not production capacity, SLA, tail latency, or AOF durability. |
+| Local network benchmark | Three-run `redis-benchmark` comparisons at pipeline depths 1 and 16 bind loopback and disable AOF; in-process Go benchmarks separately exercise executor/storage paths. | The two benchmark families measure different costs and omit durable write performance in the network comparison. | Results and host parameters are in README. Useful for repeatable local comparison only, not production capacity, SLA, tail latency, or AOF durability. |
 | Central limit theorem | No implementation choice is based on the central limit theorem. | It provides no evidence for a particular shard count or lock-contention behavior. | Choosing shard count requires direct representative workload measurements; the repository currently has no shard-count study. |
 
 ## 14. Safe change checklist

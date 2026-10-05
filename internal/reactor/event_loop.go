@@ -81,17 +81,19 @@ func NewEventLoopWithConfig(poller *Poller, listenerFD int, parser *command.Pars
 //      (client commands, accepts, writes) for that batch have been fully processed.
 //    - If there are NO active client requests (idle server), `poller.Wait(100)` times out after 100ms,
 //      returning 0 ready events. The loop immediately proceeds to step 3 to execute `ActiveExpireCycle()`.
-//      Thus, active expiration runs consistently at 10Hz (every 100ms) even under zero traffic.
+//      Thus, in an otherwise idle loop, expiration is checked after each nominal
+//      100ms wait; processing time means this is not a strict 10Hz schedule.
 //
 // 2. WHY RUN DIRECTLY ON THE EVENT LOOP THREAD?
 //    - The reactor is single-threaded, so the expiration sweep and client I/O are serialized on one path.
-//    - This avoids cross-thread races while keeping the work bounded by a fixed time budget.
+//    - This avoids running the sweep concurrently with reactor command dispatch.
 //    - The store still uses a mutex for correctness when it accesses shared state.
 //
-// 3. LATENCY & UNBLOCKING GUARANTEES:
-//    Because `ActiveExpireCycle()` enforces a strict 25ms hard time cap, the main event thread is
-//    guaranteed to resume calling `epoll_wait` within 25ms, keeping network latency bounded and
-//    preventing socket buffer overflows.
+// 3. LATENCY LIMITATION:
+//    The expiration cycle checks a cooperative 25ms work budget; it is not a
+//    hard elapsed-time guarantee. Command execution also runs synchronously on
+//    this event-loop path, so slow commands, AOF fsyncs, and AOFREWRITE delay
+//    processing for every connection until the loop resumes.
 
 func (el *EventLoop) Run() error {
 	defer el.cleanup()

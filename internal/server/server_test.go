@@ -7,7 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -298,6 +304,7 @@ func TestServerRecoversAOFBeforeAcceptingClients(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if got := sendRESP(t, conn, "SET", "durable", "value"); got.Type != resp.SimpleString {
 		t.Fatalf("SET response = %+v", got)
 	}
@@ -335,5 +342,256 @@ func TestServerRecoversAOFBeforeAcceptingClients(t *testing.T) {
 	if got := sendRESP(t, recoveredConn, "LRANGE", "queue", "0", "-1"); got.Type != resp.Array ||
 		len(got.Array) != 2 || got.Array[0].String != "two" || got.Array[1].String != "one" {
 		t.Fatalf("recovered LRANGE response = %+v", got)
+	}
+}
+
+func TestCrashHarnessServerProcess(t *testing.T) {
+	path := os.Getenv("CARROT_CRASH_HARNESS_AOF_PATH")
+	if path == "" {
+		return
+	}
+	cfg := config.DefaultConfig()
+	cfg.Host = "127.0.0.1"
+	cfg.Port = "0"
+	cfg.AOFPath = path
+	cfg.AOFSyncPolicy = os.Getenv("CARROT_CRASH_HARNESS_SYNC_POLICY")
+	srv := NewServer(cfg)
+	started := make(chan error, 1)
+	go func() {
+		started <- srv.Start()
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for srv.Addr() == nil && time.Now().Before(deadline) {
+		select {
+		case err := <-started:
+			t.Fatalf("crash harness server exited before listen: %v", err)
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if srv.Addr() == nil {
+		t.Fatal("crash harness server did not start listening")
+	}
+	if _, err := fmt.Fprintf(os.Stdout, "CRASH_HARNESS_READY %s\n", srv.Addr()); err != nil {
+		t.Fatal(err)
+	}
+	select {}
+}
+
+type crashHarnessProcess struct {
+	cmd  *exec.Cmd
+	addr string
+	mu   sync.Mutex
+	done bool
+}
+
+func startCrashHarnessProcess(t *testing.T, path, policy string) *crashHarnessProcess {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestCrashHarnessServerProcess$")
+	cmd.Env = append(os.Environ(),
+		"CARROT_CRASH_HARNESS_AOF_PATH="+path,
+		"CARROT_CRASH_HARNESS_SYNC_POLICY="+policy,
+	)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	process := &crashHarnessProcess{cmd: cmd}
+	t.Cleanup(func() {
+		_ = process.kill()
+	})
+	scanner := bufio.NewScanner(stdout)
+	line := make(chan string, 1)
+	scanErr := make(chan error, 1)
+	go func() {
+		if scanner.Scan() {
+			line <- scanner.Text()
+			return
+		}
+		scanErr <- scanner.Err()
+	}()
+	select {
+	case got := <-line:
+		const prefix = "CRASH_HARNESS_READY "
+		if len(got) <= len(prefix) || got[:len(prefix)] != prefix {
+			_ = process.kill()
+			t.Fatalf("unexpected crash harness readiness output %q; stderr=%q", got, stderr.String())
+		}
+		process.addr = got[len(prefix):]
+	case err := <-scanErr:
+		_ = process.kill()
+		t.Fatalf("crash harness exited before readiness: scan error=%v stderr=%q", err, stderr.String())
+	case <-time.After(15 * time.Second):
+		_ = process.kill()
+		t.Fatalf("timed out waiting for crash harness readiness; stderr=%q", stderr.String())
+	}
+	return process
+}
+
+func (p *crashHarnessProcess) kill() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.done {
+		return nil
+	}
+	p.done = true
+	if p.cmd.Process == nil {
+		return nil
+	}
+	killErr := p.cmd.Process.Kill()
+	waitErr := p.cmd.Wait()
+	if killErr != nil {
+		return fmt.Errorf("kill crash harness: %w", killErr)
+	}
+	if waitErr == nil {
+		return errors.New("crash harness exited normally; expected forced termination")
+	}
+	return nil
+}
+
+func crashHarnessRequest(args ...string) ([]byte, error) {
+	values := make([]resp.Value, len(args))
+	for i, arg := range args {
+		values[i] = resp.NewBulkString(arg)
+	}
+	var request bytes.Buffer
+	writer := bufio.NewWriter(&request)
+	if err := resp.NewEncoder(writer).Encode(resp.NewArray(values...)); err != nil {
+		return nil, err
+	}
+	if err := writer.Flush(); err != nil {
+		return nil, err
+	}
+	return request.Bytes(), nil
+}
+
+func writeCrashHarnessCommand(conn net.Conn, decoder *resp.Decoder, args ...string) (resp.Value, error) {
+	request, err := crashHarnessRequest(args...)
+	if err != nil {
+		return resp.Value{}, err
+	}
+	for len(request) > 0 {
+		n, err := conn.Write(request)
+		if err != nil {
+			return resp.Value{}, err
+		}
+		request = request[n:]
+	}
+	return decoder.Decode()
+}
+
+func TestCrashHarnessAcknowledgedWritesSurviveSIGKILL(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("AOF crash-recovery harness requires Linux")
+	}
+	const acknowledgedTarget = 100
+	for _, policy := range []string{"always", "everysec"} {
+		t.Run(policy, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "appendonly.aof")
+			writerProcess := startCrashHarnessProcess(t, path, policy)
+			conn, err := net.DialTimeout("tcp", writerProcess.addr, 3*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			decoder := resp.NewDecoder(bufio.NewReader(conn))
+			acked := make(chan int, acknowledgedTarget*2)
+			writerDone := make(chan error, 1)
+			var attempted atomic.Int64
+			go func() {
+				for id := 0; ; id++ {
+					attempted.Store(int64(id + 1))
+					response, err := writeCrashHarnessCommand(
+						conn, decoder, "SET",
+						"crash-harness:"+strconv.Itoa(id), "value",
+					)
+					if err != nil {
+						writerDone <- err
+						return
+					}
+					if response.Type != resp.SimpleString || response.String != "OK" {
+						writerDone <- fmt.Errorf("SET %d response = %+v", id, response)
+						return
+					}
+					acked <- id
+				}
+			}()
+
+			acknowledged := make([]int, 0, acknowledgedTarget)
+			for len(acknowledged) < acknowledgedTarget {
+				select {
+				case id := <-acked:
+					acknowledged = append(acknowledged, id)
+				case err := <-writerDone:
+					t.Fatalf("writer stopped before %d acknowledgements: %v", acknowledgedTarget, err)
+				case <-time.After(10 * time.Second):
+					t.Fatalf("timed out after %d acknowledgements", len(acknowledged))
+				}
+			}
+			if err := writerProcess.kill(); err != nil {
+				t.Fatal(err)
+			}
+			_ = conn.Close()
+			select {
+			case <-writerDone:
+			case <-time.After(5 * time.Second):
+				t.Fatal("write goroutine did not stop after process termination")
+			}
+			for len(acked) > 0 {
+				acknowledged = append(acknowledged, <-acked)
+			}
+			attemptedCount := int(attempted.Load())
+			ackedSet := make(map[int]struct{}, len(acknowledged))
+			for _, id := range acknowledged {
+				ackedSet[id] = struct{}{}
+			}
+
+			recoveryProcess := startCrashHarnessProcess(t, path, policy)
+			defer recoveryProcess.kill()
+			recoveryConn, err := net.DialTimeout("tcp", recoveryProcess.addr, 3*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer recoveryConn.Close()
+			if err := recoveryConn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			recoveryDecoder := resp.NewDecoder(bufio.NewReader(recoveryConn))
+			recoveredAcked, recoveredUnacked := 0, 0
+			for id := 0; id < attemptedCount; id++ {
+				value, err := writeCrashHarnessCommand(
+					recoveryConn, recoveryDecoder,
+					"GET", "crash-harness:"+strconv.Itoa(id),
+				)
+				if err != nil {
+					t.Fatalf("GET key %d during recovery: %v", id, err)
+				}
+				present := value.Type == resp.BulkString && value.String == "value"
+				if _, wasAcknowledged := ackedSet[id]; wasAcknowledged {
+					if !present {
+						t.Errorf("acknowledged key %d was not recovered", id)
+					} else {
+						recoveredAcked++
+					}
+				} else if present {
+					recoveredUnacked++
+				}
+			}
+			unacknowledged := attemptedCount - len(acknowledged)
+			t.Logf("policy=%s acknowledged=%d recovered_acknowledged=%d lost_acknowledged=%d unacknowledged_attempts=%d recovered_unacknowledged=%d absent_unacknowledged=%d",
+				policy, len(acknowledged), recoveredAcked, len(acknowledged)-recoveredAcked,
+				unacknowledged, recoveredUnacked, unacknowledged-recoveredUnacked)
+			if recoveredAcked != len(acknowledged) {
+				t.Fatalf("%s lost acknowledged writes across server-process SIGKILL", policy)
+			}
+		})
 	}
 }

@@ -58,18 +58,16 @@ func (e *Executor) Execute(cmd Command) (resp.Value, error) {
 		return resp.NewSimpleString("OK"), nil
 	}
 
-	if IsMutation(cmd.Name) {
-		// Hold the lock across journal append and mutation so concurrent writes
-		// cannot be persisted in an order different from their in-memory order.
+	if IsMutation(cmd.Name) && e.journal != nil {
+		// With a journal installed, hold the lock across append and apply so
+		// persisted order matches in-memory mutation order and rewrite snapshots.
 		e.writeMu.Lock()
 		defer e.writeMu.Unlock()
-		if e.journal != nil {
-			persisted, err := e.journal.Append(cmd)
-			if err != nil {
-				return resp.Value{}, fmt.Errorf("persist command before applying it: %w", err)
-			}
-			cmd = persisted
+		persisted, err := e.journal.Append(cmd)
+		if err != nil {
+			return resp.Value{}, fmt.Errorf("persist command before applying it: %w", err)
 		}
+		cmd = persisted
 	}
 	return e.execute(cmd)
 }
