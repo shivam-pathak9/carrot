@@ -34,6 +34,13 @@ they are not empty packages in the repository. The benchmark comparison and
 performance claims in the original review are historical; use the current
 conditions and results in the [README](../README.md) instead.
 
+## Follow-up verification (2026-10-05)
+
+- Removed the standalone active-expiration demonstration; storage tests cover
+  both cleanup of expired keys and preservation of unexpired keys.
+- Added a temporary-directory, dynamically port-selected Python E2E harness
+  and wired it into Linux CI.
+
 ---
 
 ## Table of Contents
@@ -62,8 +69,7 @@ conditions and results in the [README](../README.md) instead.
 carrot/
 ├── cmd/
 │   ├── server/           # Goroutine server main
-│   ├── reactor-server/   # Epoll server main
-│   └── scale-server/     # Scale demo (misleading name)
+│   └── reactor-server/   # Epoll server main
 ├── internal/
 │   ├── aof/              # Append-only-file persistence
 │   ├── client/           # RESP client wrapper
@@ -86,7 +92,6 @@ carrot/
 |---|----------|---------|----------------|
 | 1.1 | **Minor** | `internal/logger/` is an empty package with no files. | Remove it, or add a structured logger implementation. An empty package is confusing for readers. |
 | 1.2 | **Minor** | `scripts/` and `test/` directories are empty. | Remove them from the repo (add to `.gitignore`), or add a README explaining planned use. Empty directories signal abandoned work. |
-| 1.3 | **Minor** | `cmd/scale-server/main.go` header says `// scale_test.go` and the run instruction says `go run ./cmd/scale-demo`. Neither matches the directory name `scale-server`. | Rename to `cmd/scale-demo/` and fix the file comment. This is a demo tool, not a server. |
 | 1.4 | **Minor** | `server.exe` (a Windows binary) is checked into the repo root. | Add `*.exe` to `.gitignore` and remove it from version control. Binaries should never be committed. |
 | 1.5 | **Major** | The dependency graph has clean downward flow: `cmd → server/reactor → command → storage/resp`. However, **`command` imports `storage` directly** (concrete type, not interface). This tight coupling makes it impossible to test command handlers against a mock store or swap storage implementations. | Introduce a `storage.Engine` interface that `command.Executor` depends on. The concrete `Store` implements it. This is the single biggest architectural improvement for testability. |
 
@@ -263,7 +268,7 @@ carrot/
 
 ## 10. Entry Points
 
-**Files:** [`cmd/server/main.go`](file:///home/shivam/workspace/carrot1/carrot/cmd/server/main.go), [`cmd/reactor-server/main.go`](file:///home/shivam/workspace/carrot1/carrot/cmd/reactor-server/main.go), [`cmd/scale-server/main.go`](file:///home/shivam/workspace/carrot1/carrot/cmd/scale-server/main.go)
+**Files:** [`cmd/server/main.go`](file:///home/shivam/workspace/carrot1/carrot/cmd/server/main.go), [`cmd/reactor-server/main.go`](file:///home/shivam/workspace/carrot1/carrot/cmd/reactor-server/main.go)
 
 ### What works well ✅
 
@@ -293,7 +298,7 @@ carrot/
 
 | # | Severity | Finding | File | Recommendation |
 |---|----------|---------|------|----------------|
-| 11.1 | **Major** | The README's "Project structure" section is **incomplete** — it omits `internal/aof`, `internal/client`, `internal/logger`, `internal/server`, `cmd/reactor-server`, and `cmd/scale-server`. | [`README.md`](file:///home/shivam/workspace/carrot1/carrot/README.md#L29-L38) | Add all packages with one-line descriptions. |
+| 11.1 | **Major** | The README's "Project structure" section is **incomplete** — it omits `internal/aof`, `internal/client`, `internal/logger`, and `internal/server`. | [`README.md`](file:///home/shivam/workspace/carrot1/carrot/README.md#L29-L38) | Add all packages with one-line descriptions. |
 | 11.2 | **Minor** | The reactor README references image files that don't exist in the directory: `Start Decision Options Flow-2026-07-26-082211.png` and `Start Decision Options Flow-2026-07-26-081942.png`. | [`internal/reactor/README.md`](file:///home/shivam/workspace/carrot1/carrot/internal/reactor/README.md#L55-L100) | Add the images or remove the broken references. |
 | 11.3 | **Minor** | The reactor README says IPv4 & IPv6 support but the root README says "IPv4 addresses only". These contradict. | [`README.md`](file:///home/shivam/workspace/carrot1/carrot/README.md#L122-L123) vs [`README.md`](file:///home/shivam/workspace/carrot1/carrot/README.md#L239) | Clarify: the code now supports dual-stack (IPv4+IPv6). Update the root README to match. |
 | 11.4 | **Minor** | No `CONTRIBUTING.md` or code style guide. For a "human readable" project, this would help new readers understand naming conventions and comment style. | — | Add a brief `CONTRIBUTING.md` with comment conventions, test expectations, and PR process. |
@@ -341,7 +346,7 @@ carrot/
 
 | ID | Component | Issue |
 |----|-----------|-------|
-| 1.1-1.4 | Structure | Empty dirs, checked-in binary, misnamed scale-server |
+| 1.1, 1.2, 1.4 | Structure | Empty dirs and checked-in binary |
 | 2.2-2.5 | RESP | Duplicate comments, typo, missing godocs, file naming |
 | 3.4-3.6 | Storage | Test helpers in prod code, missing docs |
 | 4.2-4.4, 4.6 | Command | Redundant parser comments, missing godoc, misleading function name |

@@ -168,9 +168,6 @@ process.
   context-bounded shutdown.
 - `cmd/reactor-server/main.go`: same settings and validation for the Linux
   reactor; on signal call `Stop`.
-- `cmd/scale-server/main.go`: create a store, seed keys with TTLs, then invoke
-  `ActiveExpireCycle` repeatedly and report the removals. It does not start a
-  listener and should not be confused with a load generator.
 
 Both server entry points currently define the same operational flags
 independently. Defaults and validation are shared through `config.Config`.
@@ -586,7 +583,6 @@ against `Execute`.
 | `internal/reactor/server.go` | Linux socket creation/bind/listen, poller setup and lifecycle |
 | `cmd/server/main.go` | Flags, validation, warning, signal-driven standard-server lifecycle |
 | `cmd/reactor-server/main.go` | Linux flags, validation, warning, signal-driven reactor lifecycle |
-| `cmd/scale-server/main.go` | Demonstration of storage active-expiration behavior |
 
 ## 8. Standard server and client internals
 

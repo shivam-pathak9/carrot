@@ -33,6 +33,9 @@ jobs:
       - name: Test
         run: go test ./...
 
+      - name: End-to-end tests
+        run: make test-e2e
+
       - name: Fuzz RESP decoder
         run: go test ./internal/protocol/resp -run '^$' -fuzz '^FuzzDecoderDoesNotPanic$' -fuzztime=5s
 

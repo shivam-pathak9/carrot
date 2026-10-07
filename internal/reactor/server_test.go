@@ -112,11 +112,13 @@ func TestReactorProcessesPipelinedRequests(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	if _, err := conn.Write([]byte("*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING\r\n")); err != nil {
+	const requests = 1024
+	pipeline := bytes.Repeat([]byte("*1\r\n$4\r\nPING\r\n"), requests)
+	if _, err := conn.Write(pipeline); err != nil {
 		t.Fatal(err)
 	}
 	decoder := resp.NewDecoder(bufio.NewReader(conn))
-	for i := 0; i < 2; i++ {
+	for i := 0; i < requests; i++ {
 		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
 		value, err := decoder.Decode()
 		if err != nil {

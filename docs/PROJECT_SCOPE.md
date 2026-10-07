@@ -74,7 +74,8 @@ the Go source remains authoritative.
 Do not expose Carrot to untrusted networks or rely on AOF as the only copy of
 important production data. The current implementation has no authentication
 or encryption; backup automation and broad crash/failure validation are still
-missing. AOF rewrite is manual and synchronous. The default bind remains
+missing. AOF rewrite is manual and synchronous, and `always` syncs each
+mutation separately without group commit. The default bind remains
 `0.0.0.0` by choice, with an explicit startup warning; local deployments
 should bind to loopback.
 There is no total database-memory quota or metrics. Passing tests does not
@@ -92,8 +93,9 @@ close these operational gaps.
    are implemented and tested, including recovery and rewrite failure paths.
    A network-level server-process SIGKILL harness checks acknowledged writes
    under `always` and `everysec`; it does not simulate OS/power loss.
-   Systematic fault validation and backup procedures remain before this phase
-   is complete.
+   Recovery is also tested against a final record truncated at every byte
+   offset. Injected write/fsync/directory-sync failures, OS/power-loss
+   validation, and backup procedures remain before this phase is complete.
 4. **Phase 3 — Correctness under stress:** race checks, deterministic rewrite
    serialization tests, repeatable network microbenchmarks, and a bounded RESP
    decoder fuzz run in CI are in place. Longer fuzzing, sustained-load testing,

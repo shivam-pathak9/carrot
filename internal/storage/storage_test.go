@@ -528,6 +528,30 @@ func TestActiveExpireCycleRemovesExpiredKeys(t *testing.T) {
 	}
 }
 
+func TestActiveExpireCycleDoesNotRemoveUnexpiredKeys(t *testing.T) {
+	store := NewStore()
+
+	for i := 0; i < 20; i++ {
+		key := fmt.Sprintf("live-%d", i)
+		store.setRawObj(key, Obj{
+			Value:     fmt.Sprintf("value-%d", i),
+			ExpiresAt: time.Now().Add(time.Minute),
+		})
+	}
+
+	if deleted := store.ActiveExpireCycle(); deleted != 0 {
+		t.Fatalf("active expiry removed %d unexpired keys, want 0", deleted)
+	}
+	for i := 0; i < 20; i++ {
+		key := fmt.Sprintf("live-%d", i)
+		if obj, exists := store.getRawObj(key); !exists {
+			t.Errorf("unexpired key %q was removed", key)
+		} else if want := fmt.Sprintf("value-%d", i); obj.Value != want {
+			t.Errorf("key %q value = %q, want %q", key, obj.Value, want)
+		}
+	}
+}
+
 func TestActiveExpireCycleStopsBelowThreshold(t *testing.T) {
 	store := NewStore()
 

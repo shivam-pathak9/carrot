@@ -16,6 +16,7 @@ bin/
 # Go
 coverage.out
 *.test
+.carrot-test-bin/
 
 # macOS
 .DS_Store

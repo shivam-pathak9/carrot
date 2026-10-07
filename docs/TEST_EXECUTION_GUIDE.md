@@ -19,24 +19,44 @@ go vet ./...
 Linux for pushes and pull requests. CI also runs the RESP decoder fuzz target
 for five seconds after the regular unit tests.
 
+## Network end-to-end harness
+
+On Linux/WSL, run the Python standard-library harness against both server
+implementations:
+
+```sh
+make test-e2e
+# Or select one server / skip the AOF restart-and-rewrite suite:
+python3 scripts/python_e2e.py --server standard
+python3 scripts/python_e2e.py --server reactor --skip-aof
+```
+
+The harness builds its binaries in a temporary directory, selects loopback
+ports dynamically, and removes its logs and AOF files when it exits. It checks
+RESP fragmentation and pipelining, documented string/list behavior, malformed
+requests, concurrent clients, and AOF rewrite/restart recovery. This
+supplements rather than replaces the focused Go tests; the server-process
+tests do not simulate OS or power loss.
+
 ## Reproducible server benchmark
 
-Install the Redis CLI tools (`redis-cli` and `redis-benchmark`), then run:
+Install Redis (`redis-server`, `redis-cli`, and `redis-benchmark`), then run:
 
 ```sh
 make benchmark | tee benchmark-results.txt
 ```
 
-The script builds both Linux server modes, binds them to loopback, disables
-AOF so the measurements focus on network and in-memory command handling. By
-default it runs three rounds of the same PING/string/list command cases at
-pipeline depths 1 and 16. It reports the date, host/kernel, Go version, Redis
-benchmark version, and benchmark parameters. Set `BENCH_PIPELINE=1` to run
-only depth 1, or set it to another positive integer to run depth 1 and that
-depth. Override `BENCH_RUNS`, `BENCH_REQUESTS`, `BENCH_CLIENTS`,
-`BENCH_DATA_SIZE`, `STANDARD_PORT`, and `REACTOR_PORT` as needed. It refuses
-ports where a Redis-compatible server already responds, and stops only the
-server processes it starts.
+The script builds both Linux server modes and starts an isolated temporary
+Redis instance. Persistence is disabled for all three servers so measurements
+focus on network and in-memory command handling. By default it runs three
+rounds of the same PING/string/list command cases at pipeline depths 1 and 16.
+It reports the date, host/kernel, Go version, Redis benchmark and server
+versions, and benchmark parameters. Set `BENCH_PIPELINE=1` to run only depth 1,
+or set it to another positive integer to run depth 1 and that depth. Override
+`BENCH_RUNS`, `BENCH_REQUESTS`, `BENCH_CLIENTS`, `BENCH_DATA_SIZE`,
+`STANDARD_PORT`, `REACTOR_PORT`, and `REDIS_PORT` as needed. It refuses ports
+where a Redis-compatible server already responds, and stops only the server
+processes it starts.
 
 These measurements are local comparisons, not capacity guarantees or SLAs.
 For durability-enabled write throughput, repeat separately with AOF enabled
@@ -93,6 +113,14 @@ in a machine-level failure, and scheduler/filesystem stalls mean one second
 is not a strict upper bound. `always` also cannot guarantee survival of
 hardware or filesystem failures beyond what the OS reports as a successful
 sync.
+
+The AOF unit suite also truncates a valid final record at every byte offset
+and verifies that recovery preserves all preceding records while discarding
+the incomplete tail. This covers torn-record parsing boundaries, not injected
+write, `fsync`, directory-sync, or machine-power failures. A live Redis
+differential test for the common command subset runs with
+`go test ./internal/command` when `redis-server` is installed; otherwise it
+skips.
 
 Run one package or test when iterating:
 

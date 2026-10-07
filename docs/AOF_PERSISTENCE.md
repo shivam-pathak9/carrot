@@ -61,12 +61,13 @@ executing first could change memory if the subsequent append fails.
 Use `AOFREWRITE` to compact the log to the current live string and list values.
 The command is synchronous in this initial implementation: mutation commands
 wait while Carrot streams the snapshot, syncs a same-directory temporary file,
-and atomically renames it over the old AOF. Standard-server read handlers can continue; the reactor event
-loop cannot process reads until the rewrite returns. In reactor mode, an
-`always`-policy mutation also blocks the event loop while its per-command
-`file.Sync` runs. The replacement is locked before rename so another Carrot
-process cannot open it during the handoff. Mutations waiting for the rewrite
-are appended to the new file after the rewrite completes. Rewriting
+and atomically renames it over the old AOF. Standard-server read handlers can
+continue; the reactor event loop cannot process requests until the rewrite
+returns. In reactor mode, an `always`-policy mutation also blocks the event
+loop while its per-command `file.Sync` runs. There is no group commit: `always`
+performs one sync per mutation. The replacement is locked before rename so
+another Carrot process cannot open it during the handoff. Mutations waiting
+for the rewrite are appended to the new file after the rewrite completes. Rewriting
 temporarily requires disk space for both the old log and the compacted
 replacement. If snapshot writing fails before rename, the original AOF remains
 in place; if syncing the directory
@@ -97,8 +98,8 @@ The implementation is split across a few focused files:
   AOF is created, so the filename entry is made durable as well as file data.
   `sync_directory_other.go` reports unsupported use on non-Linux systems.
 - `internal/aof/aof_test.go` tests record replay, expiration deadlines,
-  truncated tails, corrupt records, exclusive locking, sync policy, and failed
-  appends.
+  truncation at every byte boundary of a final record, corrupt records,
+  exclusive locking, sync policy, and failed appends.
 - `internal/command/executor.go` is the shared write boundary used by both
   servers. It holds a mutex across append and in-memory execution, ensuring
   journal order and state-change order agree. `AOFREWRITE` holds the same

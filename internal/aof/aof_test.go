@@ -137,6 +137,65 @@ func TestAOFTruncatesIncompleteFinalRecord(t *testing.T) {
 	}
 }
 
+func TestAOFRecoveryAtEveryTornRecordBoundary(t *testing.T) {
+	record := func(cmd command.Command) []byte {
+		t.Helper()
+		var data bytes.Buffer
+		writer := bufio.NewWriter(&data)
+		if err := writeRecord(writer, cmd); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		return append([]byte(nil), data.Bytes()...)
+	}
+	base := record(command.Command{Name: "SET", Args: []string{"baseline", "kept"}})
+	next := record(command.Command{Name: "SET", Args: []string{"boundary", "complete"}})
+
+	for cut := 0; cut <= len(next); cut++ {
+		t.Run(strconv.Itoa(cut), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "appendonly.aof")
+			data := append(append([]byte(nil), base...), next[:cut]...)
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			store := storage.NewStore()
+			logFile, err := Open(path, "always", store)
+			if err != nil {
+				t.Fatalf("recover at byte %d: %v", cut, err)
+			}
+			t.Cleanup(func() {
+				if err := logFile.Close(); err != nil {
+					t.Errorf("close recovered AOF: %v", err)
+				}
+			})
+
+			executor := command.NewExecutor(store)
+			if got := execute(t, executor, "GET", "baseline"); got.Type != resp.BulkString || got.String != "kept" {
+				t.Fatalf("baseline at byte %d = %+v, want kept", cut, got)
+			}
+			got := execute(t, executor, "GET", "boundary")
+			if cut == len(next) {
+				if got.Type != resp.BulkString || got.String != "complete" {
+					t.Fatalf("complete record at byte %d = %+v", cut, got)
+				}
+			} else if got.Type != resp.BulkString || !got.IsNull {
+				t.Fatalf("torn record at byte %d recovered as %+v", cut, got)
+			}
+			if cut < len(next) {
+				info, err := os.Stat(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if info.Size() != int64(len(base)) {
+					t.Fatalf("recovered size at byte %d = %d, want %d", cut, info.Size(), len(base))
+				}
+			}
+		})
+	}
+}
+
 func TestAOFCorruptionAndExclusiveLock(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "appendonly.aof")
 	first, err := Open(path, "no", storage.NewStore())

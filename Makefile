@@ -1,4 +1,4 @@
-.PHONY: build test test-race cover vet fmt-check check benchmark
+.PHONY: build test test-race test-e2e cover vet fmt-check check benchmark
 
 build:
 	go build ./...
@@ -8,6 +8,9 @@ test:
 
 test-race:
 	go test -race ./...
+
+test-e2e:
+	python3 scripts/python_e2e.py
 
 cover:
 	go test -cover ./...

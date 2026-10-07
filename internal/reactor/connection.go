@@ -151,16 +151,20 @@ func (c *Connection) OnRead() error {
 // processCommands tries to decode and execute one or more RESP commands pending in c.inBuf.
 //
 // It handles partial TCP packets safely by leaving incomplete frames in the buffer until the next read.
-// A successful decode advances the buffer by exactly the number of bytes consumed, so pipelined commands
-// are processed in order without skipping data.
+// A successful decode advances the logical input cursor by exactly the number
+// of bytes consumed, so pipelined commands are processed in order without
+// recreating a reader for the remaining input.
 func (c *Connection) processCommands() error {
-	for c.inBuf.Len() > 0 {
-		raw := c.inBuf.Bytes()               // Inspect current byte slice snapshot in inBuf
-		reader := bytes.NewReader(raw)       // Create reader over snapshot
-		bufReader := bufio.NewReader(reader) // Wrap in bufio.Reader required by RESP Decoder
-		decoder := resp.NewDecoderWithLimit(bufReader, c.maxInbound)
+	raw := c.inBuf.Bytes()
+	reader := bytes.NewReader(raw)
+	bufReader := bufio.NewReader(reader)
+	decoder := resp.NewDecoderWithLimit(bufReader, c.maxInbound)
+	consumed := 0
+	consume := func() {
+		c.inBuf.Next(consumed)
+	}
 
-		// Attempt to decode next RESP Value
+	for consumed < len(raw) {
 		value, err := decoder.Decode()
 		if err != nil {
 			// Detect partial TCP command payload (waiting for more network data)
@@ -172,6 +176,7 @@ func (c *Connection) processCommands() error {
 			// Malformed protocol error: send RESP Error response and reset input buffer
 			respErr := resp.NewError(fmt.Sprintf("ERR protocol error: %v", err))
 			if writeErr := c.writeResponse(respErr); writeErr != nil {
+				consume()
 				return writeErr
 			}
 			c.inBuf.Reset()
@@ -190,14 +195,14 @@ func (c *Connection) processCommands() error {
 		//
 		//   Correct formula:
 		//     consumed = total_snapshot - bytes_never_read_into_bufio - bytes_in_bufio_but_not_decoded
-		consumed := len(raw) - reader.Len() - bufReader.Buffered()
-		c.inBuf.Next(consumed) // Advance inBuf by consumed byte count
+		consumed = len(raw) - reader.Len() - bufReader.Buffered()
 
 		// Step 1: Parse decoded RESP Value into structured Command (Name & Args)
 		cmd, err := c.parser.Parse(value)
 		if err != nil {
 			respErr := resp.NewError(err.Error())
 			if writeErr := c.writeResponse(respErr); writeErr != nil {
+				consume()
 				return writeErr
 			}
 			continue
@@ -208,6 +213,7 @@ func (c *Connection) processCommands() error {
 		if err != nil {
 			respErr := resp.NewError(err.Error())
 			if writeErr := c.writeResponse(respErr); writeErr != nil {
+				consume()
 				return writeErr
 			}
 			continue
@@ -215,10 +221,12 @@ func (c *Connection) processCommands() error {
 
 		// Step 3: Serialize response Value into bounded outbound buffer outBuf
 		if err := c.writeResponse(response); err != nil {
+			consume()
 			return err
 		}
 	}
 
+	consume()
 	// Attempt to flush queued outbound response bytes to non-blocking socket
 	return c.Flush()
 }

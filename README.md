@@ -1,49 +1,85 @@
 <p align="center">
-  <img src="assets/carrot_logo.png" alt="Carrot Retro Logo" width="280" />
+  <img src="assets/carrot_logo.png" alt="Carrot logo" width="190" />
 </p>
 
 <h1 align="center">🥕 Carrot</h1>
 
 <p align="center">
-  <b>Carrot is a Redis-inspired single-node server written in Go.</b><br/>
-  It is an in-memory development project progressing toward production readiness; it is not currently safe for production data.
+  <b>A Redis-inspired in-memory data server, built in Go.</b><br/>
+  Explore RESP, append-only persistence, and two contrasting TCP concurrency models.
 </p>
 
 <p align="center">
-  Architecture references: <a href="HLD.md">HLD</a> · <a href="LLD.md">LLD</a>
+  <a href="https://github.com/shivam-pathak9/carrot/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/shivam-pathak9/carrot/actions/workflows/ci.yml/badge.svg"></a>
+  <img alt="Go 1.26.4" src="https://img.shields.io/badge/Go-1.26.4-00ADD8?logo=go&logoColor=white">
+  <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
 </p>
 
----
+## Why Carrot?
 
-## What this project includes
+Carrot is a systems project focused on correctness and trade-offs—not a claim
+of Redis compatibility or production readiness. It currently demonstrates:
 
-Carrot currently includes:
+| Area | What is implemented |
+|---|---|
+| Protocol & commands | RESP framing; string and list commands; type and TTL semantics |
+| Storage | Sharded in-memory store with passive and bounded active expiration |
+| Persistence | Linux AOF append, replay, sync policies, and manual rewrite |
+| Networking | Portable goroutine-per-client server and Linux epoll reactor |
+| Reliability | Resource limits, graceful shutdown, race-tested packages, and TCP E2E coverage |
 
-- A RESP parser and encoder for Redis-style wire protocol messages
-- An in-memory storage layer with string and list values plus TTL support
-- String and expiration commands: `PING`, `GET`, `SET`, `DEL`, `TTL`, `EXPIRE`, and `PEXPIREAT`
-- AOF append, streaming recovery, configurable sync policies, and manual rewrite/compaction on Linux
-- Redis-style list commands including pushes, pops, ranges, indexed updates, trimming, removal, insertion, positions, and atomic moves
-- A per-connection goroutine server built with Go net listeners
-- A Linux epoll-based reactor server for non-blocking I/O
-- Scheduled background expiration cleanup for stale keys
-- Unit, TCP integration, and AOF recovery tests across the core packages
+The two servers share the command and storage layers, making their networking
+trade-offs directly comparable. The reactor is Linux-only and runs command
+execution on its event loop; it is not automatically faster for every workload.
 
----
+## Quick start
 
-## Project structure
+Requires Go 1.26.4. On Linux, start the standard server on loopback:
 
-- `cmd/server` — goroutine-based TCP server
-- `cmd/reactor-server` — epoll-based event loop server
-- `cmd/scale-server` — active-expiration scale demonstration; not a network load server
-- `internal/command` — command parsing and execution logic
-- `internal/config` — configuration defaults
-- `internal/protocol/resp` — RESP framing, encoder/decoder
-- `internal/storage` — Map-based in-memory key store with TTL support
-- `internal/aof` — Linux-only append-only persistence, replay, and compaction
-- `internal/server` — goroutine-server lifecycle and client handling
-- `internal/client` — client connection and protocol helpers
-- `internal/reactor` — reactor implementation and architecture docs
+```bash
+go run ./cmd/server -host 127.0.0.1 -port 16379
+```
+
+In another terminal, use `redis-cli` or any RESP client:
+
+```bash
+redis-cli -h 127.0.0.1 -p 16379 PING
+redis-cli -h 127.0.0.1 -p 16379 SET greeting "Hello, Carrot!"
+redis-cli -h 127.0.0.1 -p 16379 GET greeting
+```
+
+The server enables AOF persistence by default and writes `appendonly.aof` in
+its working directory. See [AOF persistence](docs/AOF_PERSISTENCE.md) before
+changing sync policy or relying on stored data. The default server bind is
+`0.0.0.0`; the example deliberately binds to loopback because Carrot has no
+authentication or transport encryption.
+
+## Architecture at a glance
+
+```text
+RESP client
+    |
+    +-- cmd/server         -> goroutine per connection --+
+    |                                                     |
+    +-- cmd/reactor-server -> Linux epoll event loop -----+--> command executor
+                                                           |       |
+                                                           |       +--> sharded in-memory store
+                                                           |       +--> AOF journal (Linux)
+                                                           |
+                                                           +--> RESP replies
+```
+
+| Path | Purpose |
+|---|---|
+| `cmd/server` | Portable Go TCP server |
+| `cmd/reactor-server` | Linux epoll server |
+| `internal/protocol/resp` | RESP decoder and encoder |
+| `internal/command` | Command parsing, validation, execution, and AOF coordination |
+| `internal/storage` | Sharded strings/lists and TTL expiration |
+| `internal/aof` | Linux append-only journal, recovery, and compaction |
+
+More detail: [high-level design](HLD.md) · [low-level design](LLD.md) ·
+[project scope and readiness](docs/PROJECT_SCOPE.md).
 
 ---
 
@@ -166,17 +202,17 @@ Run the project checks:
 
 ```bash
 make check
-# Or run the Go commands individually:
-go test ./...
-go test -race ./...
-go test -cover ./...
-go build ./...
-go vet ./...
+# Optional network-level coverage (Linux/WSL):
+make test-e2e
 ```
 
-Server and reactor TCP integration tests run as part of `go test ./...`.
-GitHub Actions runs formatting, tests, race tests, coverage, vet, and build
-checks on Linux for pushes and pull requests.
+`make check` runs formatting, tests, race checks, coverage, vet, and builds.
+`make test-e2e` exercises both network servers, protocol boundaries,
+concurrency, and AOF restart/rewrite behavior. GitHub Actions runs the Go
+checks, the Linux E2E harness, and a bounded RESP decoder fuzz run.
+When `redis-server` is installed, `go test ./internal/command` also runs a
+live differential test for the common string/list command subset; otherwise
+that test is skipped.
 
 ---
 
@@ -208,44 +244,50 @@ Important gaps before production use still include:
 
 ## Local benchmarks
 
-The following loopback comparison was run on 2026-10-04 with
-`redis-benchmark 7.0.15`, Go 1.26.4, on WSL2 Linux/amd64 (12 logical CPUs,
-kernel `6.18.33.2-microsoft-standard-WSL2`). AOF was disabled. Each of three
-runs sent 10,000 requests per command with 10 clients and a 16-byte payload.
-Numbers below are medians of the three reported throughputs; these are
-observations on this host, not a general ranking of the two server designs.
+The following loopback comparison was run on 2026-10-05 with
+`redis-benchmark 7.0.15`, Redis Server 7.0.15, and Go 1.26.4, on WSL2
+Linux/amd64 (12 logical CPUs, kernel
+`6.18.33.2-microsoft-standard-WSL2`). AOF/persistence was disabled for all
+three servers. Each of three runs sent 10,000 requests per command with 10
+clients and a 16-byte payload. Numbers below are medians of the three
+reported throughputs, in requests per second; these are observations on this
+host, not a general ranking or capacity guarantee.
 
 ### Pipeline depth 1
 
-| Command | Goroutine req/s | Reactor req/s |
-|---|---:|---:|
-| PING_INLINE | 28,736 | 44,053 |
-| PING_MBULK | 28,169 | 46,083 |
-| SET | 28,653 | 42,918 |
-| GET | 28,011 | 42,735 |
-| LPUSH | 25,907 | 36,101 |
-| RPUSH | 24,331 | 35,461 |
-| LPOP | — | 35,971 |
-| RPOP | 26,596 | 36,232 |
+| Command | Goroutine req/s | Reactor req/s | Redis req/s |
+|---|---:|---:|---:|
+| PING_INLINE | 29,412 | 40,816 | 49,751 |
+| PING_MBULK | 30,030 | 45,045 | 52,910 |
+| SET | 29,240 | 41,152 | 52,910 |
+| GET | 28,902 | 42,553 | 53,763 |
+| LPUSH | 28,490 | 42,918 | 50,251 |
+| RPUSH | 27,548 | 40,323 | 53,763 |
+| LPOP | 27,778 | 39,370 | 54,945 |
+| RPOP | 27,933 | 37,313 | 57,471 |
 
 ### Pipeline depth 16
 
-| Command | Goroutine req/s | Reactor req/s |
-|---|---:|---:|
-| PING_INLINE | 113,636 | 175,439 |
-| PING_MBULK | 114,943 | 161,290 |
-| SET | 108,696 | 125,000 |
-| GET | 100,000 | 128,205 |
-| LPUSH | 100,000 | 129,870 |
-| RPUSH | 93,458 | 111,111 |
-| LPOP | 97,087 | 109,890 |
-| RPOP | 100,000 | 114,943 |
+| Command | Goroutine req/s | Reactor req/s | Redis req/s |
+|---|---:|---:|---:|
+| PING_INLINE | 126,582 | 232,558 | 909,091 |
+| PING_MBULK | 129,870 | 192,308 | 769,231 |
+| SET | 125,000 | 178,571 | 588,235 |
+| GET | 119,048 | 178,571 | 714,286 |
+| LPUSH | 119,048 | 175,439 | 588,235 |
+| RPUSH | 107,527 | 151,515 | 714,286 |
+| LPOP | 109,890 | 158,730 | 588,235 |
+| RPOP | 105,263 | 169,492 | 666,667 |
 
-One of the three standard-server pipeline-1 `LPOP` runs returned a negative
-throughput value from `redis-benchmark` despite reporting ordinary latency.
-That result is invalid and is omitted rather than presented as a measurement;
-the other two runs were positive. This is a reminder that benchmark output
-needs sanity checks, not just aggregation.
+In this run, the reactor delivered about 1.34–1.51x the goroutine server's
+throughput at pipeline depth 1, and 1.41–1.84x at depth 16. Redis was about
+1.17–1.54x faster than the reactor at depth 1 and 3.3–4.7x faster at depth 16.
+Pipelining raised throughput but also increased observed request latency;
+for example, the reactor's depth-16 p95 latencies ranged from about 1.31 to
+1.74 ms across these commands. The earlier 2026-10-04 reactor-only depth-16
+measurements in this environment were 19–47% lower across the same command
+cases; this before/after comparison is suggestive, not a controlled attribution
+of the difference solely to the parser change.
 
 For a direct storage-level parallel measurement, this host reported
 `BenchmarkStoreParallelSetGet` at 53.11, 60.45, and 58.33 ns/op (median
@@ -262,9 +304,12 @@ key. With no journal, executor mutations rely on shard locks and do not take
 the journal-ordering mutex. This is an in-process microbenchmark, not a
 network benchmark or an AOF-enabled contention measurement.
 
-Reproduce the network comparison with `make benchmark`; by default it runs
-pipeline depths 1 and 16, three times each, and prints environment and
-parameter details. Set `BENCH_PIPELINE=1` to run only depth 1, or set it to
+Reproduce the network comparison and Redis reference baseline with
+`make benchmark`; by default it runs pipeline depths 1 and 16, three times
+each, and prints environment and parameter details. The script requires
+`redis-server`, `redis-cli`, and `redis-benchmark`, uses three distinct
+loopback ports, and refuses to use ports where a Redis-compatible service
+already responds. Set `BENCH_PIPELINE=1` to run only depth 1, or set it to
 another positive depth to run depth 1 and that depth. See
 [docs/TEST_EXECUTION_GUIDE.md](docs/TEST_EXECUTION_GUIDE.md) for further
 overrides. Reproduce the store benchmark with

@@ -49,7 +49,6 @@ this subset are not implemented.
 cmd/
   server/             Go net.Listener, one goroutine per client
   reactor-server/     Linux epoll server entry point
-  scale-server/       Local active-expiration demonstration; no TCP listener
 internal/
   config/             Shared runtime configuration and validation
   protocol/resp/      RESP values, bounded decoder, encoder
@@ -67,7 +66,6 @@ The two production-style server binaries are `cmd/server` and
 `cmd/reactor-server`. They create independent stores and executors and use the
 same `config`, `command`, `storage`, `aof`, and RESP implementations. The
 reactor uses direct file-descriptor I/O; it does not use `internal/client`.
-`cmd/scale-server` is a storage demonstration, not a third network server.
 
 ## 3. System context and components
 
