@@ -24,7 +24,7 @@ of Redis compatibility or production readiness. It currently demonstrates:
 |---|---|
 | Protocol & commands | RESP framing; string and list commands; type and TTL semantics |
 | Storage | Sharded in-memory store with passive and bounded active expiration |
-| Persistence | Linux AOF append, replay, sync policies, and manual rewrite |
+| Persistence | Linux AOF append, replay, group commit, sync policies, and background rewrite |
 | Networking | Portable goroutine-per-client server and Linux epoll reactor |
 | Reliability | Resource limits, graceful shutdown, race-tested packages, and TCP E2E coverage |
 
@@ -158,13 +158,14 @@ go run ./cmd/server -aof-file ./data/carrot.aof -aof-sync always
 On a running server, compact the AOF from the current live data with:
 
 ```bash
-redis-cli -h 127.0.0.1 -p 6379 AOFREWRITE
+redis-cli -h 127.0.0.1 -p 16379 AOFREWRITE
 ```
 
-This initial rewrite is synchronous: writes pause until the temporary AOF is
-synced and atomically installed. Standard-server reads can proceed while the
-rewrite runs; the reactor's event loop cannot serve requests until its rewrite
-call returns. Waiting writes append to the replacement afterward.
+`AOFREWRITE` starts a background snapshot rewrite and returns `OK`; check
+progress with `AOFREWRITE STATUS`. Writes continue during snapshot serialization
+and are captured in a delta log. They pause briefly to install the delta and
+replacement. Snapshotting temporarily uses memory proportional to the live
+dataset; see [AOF persistence](docs/AOF_PERSISTENCE.md) for details.
 
 ### AOF rewrite smoke test
 
@@ -219,7 +220,7 @@ that test is skipped.
 ## Current status
 
 Carrot is an MVP and is **not production-ready**. AOF persistence, restart
-recovery, and manual rewrite/compaction are implemented, but broader
+recovery, group commit, and background rewrite/compaction are implemented, but broader
 crash/failure validation and backup procedures are still outstanding.
 Durability depends on the configured sync policy. It also has no authentication
 or transport encryption, and the default bind address is `0.0.0.0`. Use
@@ -229,7 +230,7 @@ The project currently demonstrates:
 
 - A documented subset of RESP and Redis-style string/list commands
 - In-memory typed storage and TTL behavior
-- AOF append/recovery and manual rewrite/compaction
+- AOF append/recovery, group commit, and background rewrite/compaction
 - Two networking models: goroutine-per-connection and Linux epoll
 - Unit and TCP integration tests for storage, commands, persistence, protocol,
   configuration, and both server implementations
@@ -289,20 +290,88 @@ measurements in this environment were 19–47% lower across the same command
 cases; this before/after comparison is suggestive, not a controlled attribution
 of the difference solely to the parser change.
 
+The depth-16 gap is an observation, not an explained Redis-vs-Go benchmark
+result. A separate diagnostic run used one 50,000-request round at depths 1
+and 16 on the same WSL2 host, with CPU profiling enabled. The reactor profile's
+largest flat sample was in Linux syscall handling (`Syscall6`, about 42%); it
+also showed time in Go runtime allocation/GC and RESP decoding. This points to
+the network/read/parse/runtime path as worthwhile places to investigate, but
+does not isolate a single cause or profile Redis. The reactor also processes
+commands serially on its event loop; depth-16 throughput is not evidence of
+parallel command execution. The 10,000-request, three-round measurements above
+are a small local sample, and neither those numbers nor the profile establish
+which Redis implementation detail accounts for the remaining difference.
+
+To collect diagnostic profiles (not valid throughput numbers), run:
+
+```sh
+BENCH_RUNS=1 BENCH_REQUESTS=50000 BENCH_CPU_PROFILE_DIR=/tmp/carrot-pprof make benchmark
+go tool pprof -top /tmp/carrot-pprof/reactor.cpu.pprof
+go tool pprof -top /tmp/carrot-pprof/standard.cpu.pprof
+```
+
+Each profile covers that Carrot server's complete benchmark run, including
+both pipeline depths; it does not include Redis. Profiling adds overhead, so
+do not compare the profiled throughputs with the unprofiled table above.
+
+### AOF SET throughput by sync policy
+
+A focused write benchmark was run on 2026-10-07 with the standard
+goroutine-per-client server on the same WSL2 Linux/amd64 host described above
+(Go 1.26.4, Redis benchmark tools 7.0.15). Each run issued 20,000 `SET`
+requests with 10 clients and a 16-byte payload; each cell is the median of
+three runs. The `always` and `everysec` runs used distinct AOF files. These
+are network benchmark observations, not a controlled storage-device test.
+
+| AOF policy | Pipeline | Median req/s (run range) | Median p95 ms | Median p99 ms |
+|---|---:|---:|---:|---:|
+| Disabled | 1 | 23,810 (21,075–24,752) | 0.791 | 1.527 |
+| Disabled | 16 | 99,502 (99,502–99,502) | 1.647 | 3.455 |
+| `everysec` | 1 | 20,080 (19,608–20,812) | 1.079 | 1.951 |
+| `everysec` | 16 | 49,020 (41,322–51,680) | 1.359 | 2.903 |
+| `always` | 1 | 1,415 (1,199–1,499) | 12.071 | 15.983 |
+| `always` | 16 | 1,430 (1,003–1,774) | 18.063 | 22.991 |
+
+In this sample, `always` delivered roughly 14x fewer SETs/s than `everysec`
+at depth 1 and 34x fewer at depth 16. Its depth-16 throughput was not
+materially higher than depth 1, and its p95 latency increased. This indicates
+that the synchronous durability cost remained dominant on this WSL2 setup
+despite the bounded group-commit implementation. It does **not** measure the
+improvement over the earlier per-write-fsync implementation: no matched run
+of that old implementation was collected, and fsync counts per batch were not
+instrumented. `everysec` also has a weaker crash/power-loss durability
+contract than `always`.
+
+To reproduce the SET workload, start the standard server separately for each
+policy (use a unique port and AOF path, and use `-aof-enabled=false` for the
+disabled row), then run both pipeline depths three times:
+
+```sh
+redis-benchmark --csv -h 127.0.0.1 -p 16379 \
+  -n 20000 -c 10 -d 16 -P 1 -t set
+redis-benchmark --csv -h 127.0.0.1 -p 16379 \
+  -n 20000 -c 10 -d 16 -P 16 -t set
+```
+
+The full 2026-10-07 Redis/Carrot multi-command rerun was not added to the
+comparison table: it produced negative RPS readings for some rows and large
+run-to-run swings on this host. The earlier multi-command table above remains
+a separate 2026-10-05 observation; do not combine it with the AOF SET results.
+
 For a direct storage-level parallel measurement, this host reported
 `BenchmarkStoreParallelSetGet` at 53.11, 60.45, and 58.33 ns/op (median
 58.33 ns/op; 0 allocations/op). One benchmark operation is a `Set` followed
 by a `GetString`, running directly against `Store` with `b.RunParallel`.
-It bypasses `Executor.writeMu`, compares only the current 256-shard
+It bypasses the journaled write sequencer, compares only the current 256-shard
 implementation, and is not evidence that command mutations execute in
 parallel or that 256 shards is optimal.
 
 The AOF-disabled `BenchmarkExecutorParallelSetGet` measured 135.0, 130.9,
 and 129.0 ns/op (median 130.9 ns/op; 48 B/op and 2 allocations/op). Each
 iteration executes `SET` then `GET` through `Executor` on a worker-selected
-key. With no journal, executor mutations rely on shard locks and do not take
-the journal-ordering mutex. This is an in-process microbenchmark, not a
-network benchmark or an AOF-enabled contention measurement.
+key. With no journal, executor mutations rely on shard locks and bypass the
+journaled write sequencer. This is an in-process microbenchmark, not a network
+benchmark or an AOF-enabled contention measurement.
 
 Reproduce the network comparison and Redis reference baseline with
 `make benchmark`; by default it runs pipeline depths 1 and 16, three times
@@ -361,11 +430,11 @@ capacity guarantees, SLAs, or production-readiness evidence.
 Carrot was built to explore two concurrency models:
 
 1. A simple per-client goroutine server for clarity and ease of debugging
-2. A Linux epoll reactor for lower-overhead, event-driven networking
+2. A Linux epoll reactor for readiness-driven networking and comparison
 
 The repository-level architecture source of truth is
 [HLD.md](HLD.md) (system behavior and component interactions) and
-[LLD.md](LLD.md) (code structures, algorithms, and synchronization). Read
+[LLD.md](LLD.md) (implementation map and synchronization boundaries). Read
 those documents with the source; package-specific guides are supplementary.
 
 Carrot is not a drop-in Redis replacement. The project goal, out-of-scope

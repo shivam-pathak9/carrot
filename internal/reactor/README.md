@@ -19,7 +19,7 @@ measurements.
 | Architecture | Model | Execution path | Tradeoff |
 | :--- | :--- | :--- | :--- |
 | **Per-Client Goroutine** (`internal/server`) | One goroutine per connection | Blocking I/O through Go `net.Conn`; handlers can run concurrently | Straightforward connection isolation, with per-connection goroutine and buffer costs |
-| **Reactor Event Loop** (`internal/reactor`) | One event loop for all connections | Non-blocking socket I/O and command execution on one loop | Avoids a goroutine per connection, but a slow command, `always` AOF sync, or synchronous `AOFREWRITE` blocks processing for all connections |
+| **Reactor Event Loop** (`internal/reactor`) | One event loop for all connections | Non-blocking socket I/O and command execution on one loop | Avoids a goroutine per connection, but a slow command, `always` group commit, snapshot capture, or rewrite finalization can delay processing for all connections |
 
 The reactor is an alternative I/O model, not a guarantee of C10K-scale
 capacity or lower latency. The repository's local benchmarks do not establish

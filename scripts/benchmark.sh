@@ -4,13 +4,14 @@ set -euo pipefail
 # These defaults make local runs comparable while allowing overrides for a
 # machine with occupied ports or a larger benchmark budget.
 BENCH_RUNS=${BENCH_RUNS:-3}
-BENCH_REQUESTS=${BENCH_REQUESTS:-10000}
+BENCH_REQUESTS=${BENCH_REQUESTS:-100000}
 BENCH_CLIENTS=${BENCH_CLIENTS:-10}
 BENCH_DATA_SIZE=${BENCH_DATA_SIZE:-16}
 BENCH_PIPELINE=${BENCH_PIPELINE:-16}
 STANDARD_PORT=${STANDARD_PORT:-16379}
 REACTOR_PORT=${REACTOR_PORT:-16380}
 REDIS_PORT=${REDIS_PORT:-16381}
+BENCH_CPU_PROFILE_DIR=${BENCH_CPU_PROFILE_DIR:-}
 
 for tool in go redis-cli redis-benchmark redis-server timeout; do
 	if ! command -v "$tool" >/dev/null 2>&1; then
@@ -60,6 +61,10 @@ else
 fi
 echo "Pipeline depths: ${pipeline_depths[*]}"
 echo "AOF disabled for Carrot and Redis to compare network and in-memory command paths."
+if [[ -n "$BENCH_CPU_PROFILE_DIR" ]]; then
+	mkdir -p "$BENCH_CPU_PROFILE_DIR"
+	echo "CPU profiles will be written to $BENCH_CPU_PROFILE_DIR (profile runs are diagnostic, not throughput measurements)."
+fi
 
 ensure_port_free() {
 	local port=$1
@@ -125,9 +130,13 @@ run_server() {
 	local binary=$2
 	local port=$3
 	local log_file="$tmp_dir/$name.log"
+	local profile_args=()
 
 	ensure_port_free "$port"
-	"$binary" -host 127.0.0.1 -port "$port" -aof-enabled=false >"$log_file" 2>&1 &
+	if [[ -n "$BENCH_CPU_PROFILE_DIR" ]]; then
+		profile_args=(-cpu-profile "$BENCH_CPU_PROFILE_DIR/$name.cpu.pprof")
+	fi
+	"$binary" -host 127.0.0.1 -port "$port" -aof-enabled=false "${profile_args[@]}" >"$log_file" 2>&1 &
 	server_pid=$!
 
 	wait_ready "$name" "$port" "$log_file"

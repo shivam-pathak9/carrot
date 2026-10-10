@@ -61,7 +61,11 @@ processes it starts.
 These measurements are local comparisons, not capacity guarantees or SLAs.
 For durability-enabled write throughput, repeat separately with AOF enabled
 and report the sync policy; do not compare those results as if they had the
-same durability cost.
+same durability cost. To collect diagnostic CPU profiles for the Carrot
+servers, set `BENCH_CPU_PROFILE_DIR=/tmp/carrot-pprof`; the profiles cover the
+complete Carrot benchmark runs and exclude Redis. Profiling adds overhead and
+invalidates throughput comparison. See the README for the measured profile
+summary and limitations.
 
 Command-layer Go benchmarks can be run without the network server:
 
@@ -70,12 +74,12 @@ go test -run '^$' -bench . ./internal/command
 go test -run '^$' -bench . ./internal/storage
 ```
 
-The storage parallel benchmark runs directly against the sharded store, outside
-`Executor.writeMu`; it does not compare shard counts or prove that 256 is
-optimal. `BenchmarkExecutorParallelSetGet` also measures command execution
-without a journal, where the executor mutex is bypassed. It does not measure
-AOF-enabled contention. These benchmarks measure in-process paths, not
-client-to-server throughput.
+The storage parallel benchmark runs directly against the sharded store,
+outside the journaled write sequencer; it does not compare shard counts or
+prove that 256 is optimal. `BenchmarkExecutorParallelSetGet` also measures
+command execution without a journal, where the write sequencer is bypassed.
+It does not measure AOF-enabled contention. These benchmarks measure
+in-process paths, not client-to-server throughput.
 
 The RESP decoder fuzz target can be run for a bounded duration with:
 

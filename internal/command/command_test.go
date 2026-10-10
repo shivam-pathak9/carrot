@@ -66,6 +66,80 @@ func TestExecutorConcurrentMutationsWithoutJournal(t *testing.T) {
 	}
 }
 
+type groupedTestJournal struct {
+	mu       sync.Mutex
+	maxBatch int
+	delay    time.Duration
+}
+
+func (j *groupedTestJournal) Append(cmd Command) (Command, error) {
+	return cmd, nil
+}
+
+func (j *groupedTestJournal) AppendBatch(commands []Command) ([]Command, error) {
+	j.mu.Lock()
+	if len(commands) > j.maxBatch {
+		j.maxBatch = len(commands)
+	}
+	j.mu.Unlock()
+	return append([]Command(nil), commands...), nil
+}
+
+func (j *groupedTestJournal) GroupCommitDelay() time.Duration {
+	return j.delay
+}
+
+func (j *groupedTestJournal) Rewrite(*storage.Store) error { return nil }
+
+func TestExecutorGroupsConcurrentJournaledMutations(t *testing.T) {
+	const writes = 64
+	store := storage.NewStore()
+	executor := NewExecutor(store)
+	journal := &groupedTestJournal{delay: 5 * time.Millisecond}
+	executor.SetJournal(journal)
+
+	start := make(chan struct{})
+	errs := make(chan error, writes)
+	var wg sync.WaitGroup
+	for i := 0; i < writes; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			value, err := executor.Execute(Command{
+				Name: "SET",
+				Args: []string{fmt.Sprintf("group:%d", i), "value"},
+			})
+			if err != nil {
+				errs <- err
+				return
+			}
+			if value.Type != resp.SimpleString || value.String != "OK" {
+				errs <- fmt.Errorf("SET response = %+v, want OK", value)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+
+	journal.mu.Lock()
+	maxBatch := journal.maxBatch
+	journal.mu.Unlock()
+	if maxBatch < 2 {
+		t.Fatalf("largest journal batch = %d, want concurrent requests to group", maxBatch)
+	}
+	for i := 0; i < writes; i++ {
+		if value, exists := store.Get(fmt.Sprintf("group:%d", i)); !exists || value != "value" {
+			t.Errorf("grouped write %d = %q, %t", i, value, exists)
+		}
+	}
+}
+
 type blockingRewriteJournal struct {
 	mu       sync.Mutex
 	events   []string
@@ -148,6 +222,83 @@ func TestAOFRewriteBlocksMutationsUntilReplacementIsReady(t *testing.T) {
 	if len(journal.events) != 2 || journal.events[0] != "rewrite" || journal.events[1] != "append:during-rewrite" {
 		t.Fatalf("journal order = %v, want [rewrite append:during-rewrite]", journal.events)
 	}
+}
+
+type asyncBlockingRewriteJournal struct {
+	ready     chan error
+	mu        sync.Mutex
+	appended  []string
+	completed chan struct{}
+}
+
+func (j *asyncBlockingRewriteJournal) Append(cmd Command) (Command, error) {
+	j.mu.Lock()
+	j.appended = append(j.appended, cmd.Args[0])
+	j.mu.Unlock()
+	return cmd, nil
+}
+
+func (*asyncBlockingRewriteJournal) Rewrite(*storage.Store) error {
+	return fmt.Errorf("synchronous rewrite should not be used")
+}
+
+func (j *asyncBlockingRewriteJournal) StartRewrite([]storage.SnapshotEntry) (<-chan error, error) {
+	return j.ready, nil
+}
+
+func (j *asyncBlockingRewriteJournal) CompleteRewrite() error {
+	close(j.completed)
+	return nil
+}
+
+func (*asyncBlockingRewriteJournal) AbortRewrite(err error) error {
+	return err
+}
+
+func TestAOFRewriteStartsAsynchronouslyAndReportsStatus(t *testing.T) {
+	journal := &asyncBlockingRewriteJournal{
+		ready:     make(chan error, 1),
+		completed: make(chan struct{}),
+	}
+	executor := NewExecutor(storage.NewStore())
+	executor.SetJournal(journal)
+
+	response, err := executor.Execute(Command{Name: "AOFREWRITE"})
+	if err != nil || response.Type != resp.SimpleString || response.String != "OK" {
+		t.Fatalf("AOFREWRITE = (%+v, %v), want immediate OK", response, err)
+	}
+	status, err := executor.Execute(Command{Name: "AOFREWRITE", Args: []string{"STATUS"}})
+	if err != nil || status.Type != resp.Array || len(status.Array) != 2 ||
+		(status.Array[0].String != "running" && status.Array[0].String != "queued") {
+		t.Fatalf("running AOFREWRITE STATUS = (%+v, %v)", status, err)
+	}
+	if _, err := executor.Execute(Command{Name: "SET", Args: []string{"concurrent", "value"}}); err != nil {
+		t.Fatalf("write during background rewrite: %v", err)
+	}
+	journal.mu.Lock()
+	if len(journal.appended) != 1 || journal.appended[0] != "concurrent" {
+		t.Errorf("writes during rewrite = %v, want [concurrent]", journal.appended)
+	}
+	journal.mu.Unlock()
+
+	journal.ready <- nil
+	select {
+	case <-journal.completed:
+	case <-time.After(time.Second):
+		t.Fatal("background rewrite did not complete")
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		status, err = executor.Execute(Command{Name: "AOFREWRITE", Args: []string{"STATUS"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status.Array[0].String == "completed" {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("AOFREWRITE STATUS did not become completed: %+v", status)
 }
 
 func TestAOFRewriteReturnsJournalFailure(t *testing.T) {

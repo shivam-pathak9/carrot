@@ -1,21 +1,22 @@
 # Verified test baseline
 
-Validated on 2026-10-04 with Go 1.26.4 on Linux/amd64. The repository has 152
-top-level test functions in checked-in `*_test.go` files; nested subtests are
-not counted separately.
+Validated on 2026-10-07 with Go 1.26.4 on Linux/amd64. The repository has 161
+top-level test functions in `*_test.go` files; nested subtests are not counted
+separately.
 
 ## Package coverage
 
 | Package | Statement coverage | Result |
 |---|---:|---|
-| `internal/aof` | 79.1% | Pass |
+| `internal/aof` | 75.3% | Pass |
 | `internal/client` | 57.7% | Pass |
-| `internal/command` | 80.6% | Pass |
+| `internal/command` | 73.7% | Pass |
 | `internal/config` | 92.2% | Pass |
+| `internal/cpuprofile` | 81.8% | Pass |
 | `internal/protocol/resp` | 78.7% | Pass |
-| `internal/reactor` | 69.4% | Pass |
+| `internal/reactor` | 69.7% | Pass |
 | `internal/server` | 73.0% | Pass |
-| `internal/storage` | 85.3% | Pass |
+| `internal/storage` | 84.0% | Pass |
 
 Packages without tests (`cmd/*`) are not represented in these percentages.
 Coverage is package-local, not a weighted project-wide percentage.
@@ -43,7 +44,7 @@ in the [README](../README.md).
 store directly. `internal/command` includes a parallel executor Set/Get
 benchmark with no journal configured; it exercises executor dispatch and
 storage shard locks without AOF ordering overhead. Executor mutations use the
-global journal-ordering mutex only when a journal is configured. Both
+journaled write sequencer only when a journal is configured. Both
 benchmarks measure only the current 256-shard configuration; they do not
 compare shard counts or an unsharded baseline. `internal/protocol/resp` includes
 `FuzzDecoderDoesNotPanic`; ordinary tests run its seed corpus, while sustained
@@ -60,10 +61,11 @@ fuzzing is an explicit command in [TEST_EXECUTION_GUIDE.md](./TEST_EXECUTION_GUI
 - Redis CLI verification is a manual smoke test; automated tests use Go TCP
   clients.
 - AOF tests cover RESP replay, expiration preservation, incomplete-tail
-  truncation, file locking, compaction, rewrite failure cleanup, and restart
-  through both server modes. A network-level subprocess harness records
-  acknowledgements while writing under `always` and `everysec`, force-kills
-  the server process, restarts it, and verifies acknowledged keys. On the
+  truncation, file locking, bounded group commit, compaction, rewrite failure
+  cleanup, and restart through both server modes. A network-level subprocess
+  harness records acknowledgements while writing under `always` and
+  `everysec`, force-kills the server process, restarts it, and verifies
+  acknowledged keys. On the
   three repeated local runs, all 100 or 101 acknowledged writes survived each
   policy. Each run also had one in-flight unacknowledged attempt; it was
   usually absent but was recovered once. This does not simulate OS/power loss,

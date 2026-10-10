@@ -2,9 +2,9 @@
 
 ## Product goal
 
-Carrot is a single-node, Redis-inspired server written in Go. The goal is to
-grow it into a production-ready service through small, tested milestones. It is
-not currently safe to treat as a production database or a Redis replacement.
+Carrot is an educational, single-node, Redis-inspired server written in Go.
+The goal is to explore systems design through small, tested milestones. It is
+not a production service, production-readiness project, or Redis replacement.
 
 The project should prioritize data correctness, predictable resource use,
 recoverability, operability, and compatibility guarantees before feature
@@ -40,7 +40,7 @@ tests, wrong-type behavior, expiration interactions, and documentation.
 As of 2026-10-03, Carrot has:
 
 - A single-process store with RESP AOF persistence, enabled by default.
-  Durability varies by sync policy; manual synchronous compaction is available
+  Durability varies by sync policy; manual background compaction is available
   with `AOFREWRITE`, but backup automation is not.
 - String commands: `PING`, `GET`, `SET` with `EX`/`PX`/`PXAT`, `DEL`, `TTL`,
   `EXPIRE`, and `PEXPIREAT`.
@@ -60,7 +60,7 @@ As of 2026-10-03, Carrot has:
 - Host and port flags on both server binaries; the default host is
   `0.0.0.0`.
 
-The repository currently has 152 top-level unit and integration test
+The repository currently has 161 top-level unit and integration test
 functions, including server and reactor TCP behavior. That count is not a
 measure of coverage. The current package coverage is recorded in
 [TEST_SUMMARY.md](./TEST_SUMMARY.md).
@@ -74,8 +74,9 @@ the Go source remains authoritative.
 Do not expose Carrot to untrusted networks or rely on AOF as the only copy of
 important production data. The current implementation has no authentication
 or encryption; backup automation and broad crash/failure validation are still
-missing. AOF rewrite is manual and synchronous, and `always` syncs each
-mutation separately without group commit. The default bind remains
+missing. AOF rewrite is manual, and the background snapshot temporarily needs
+memory proportional to live data. `always` uses bounded group commit; mutation
+application remains ordered. The default bind remains
 `0.0.0.0` by choice, with an explicit startup warning; local deployments
 should bind to loopback.
 There is no total database-memory quota or metrics. Passing tests does not
@@ -89,7 +90,7 @@ close these operational gaps.
    connection/request/response limits, deadlines, signal-driven shutdown, and
    TCP integration tests. The all-interface default was retained by choice
    and is accompanied by a warning; loopback is recommended for local use.
-3. **Phase 2 — Durability:** AOF append/replay and manual synchronous rewrite
+3. **Phase 2 — Durability:** AOF append/replay and manual background rewrite
    are implemented and tested, including recovery and rewrite failure paths.
    A network-level server-process SIGKILL harness checks acknowledged writes
    under `always` and `everysec`; it does not simulate OS/power loss.

@@ -33,6 +33,36 @@ func execute(t *testing.T, executor *command.Executor, args ...string) resp.Valu
 	return value
 }
 
+func waitForAOFRewrite(t *testing.T, executor *command.Executor) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		status, err := executor.Execute(command.Command{
+			Name: "AOFREWRITE",
+			Args: []string{"STATUS"},
+		})
+		if err != nil {
+			t.Fatalf("query AOF rewrite status: %v", err)
+		}
+		if status.Type != resp.Array || len(status.Array) != 2 {
+			t.Fatalf("AOF rewrite status = %+v, want two-element array", status)
+		}
+		switch status.Array[0].String {
+		case "completed":
+			return
+		case "failed":
+			t.Fatalf("AOF rewrite failed: %s", status.Array[1].String)
+		case "running":
+			time.Sleep(time.Millisecond)
+		case "queued":
+			time.Sleep(time.Millisecond)
+		default:
+			t.Fatalf("unexpected AOF rewrite status: %+v", status)
+		}
+	}
+	t.Fatal("AOF rewrite did not complete before timeout")
+}
+
 func TestAOFReplaysStringListsAndAbsoluteExpirations(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "appendonly.aof")
 	store := storage.NewStore()
@@ -332,6 +362,59 @@ func TestAOFRecordsMutationThatReturnsCommandError(t *testing.T) {
 	}
 }
 
+func TestAOFGroupCommitPreservesConcurrentWrites(t *testing.T) {
+	const writes = 64
+	path := filepath.Join(t.TempDir(), "appendonly.aof")
+	store := storage.NewStore()
+	logFile, err := Open(path, "always", store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := command.NewExecutor(store)
+	executor.SetJournal(logFile)
+	start := make(chan struct{})
+	errs := make(chan error, writes)
+	var wg sync.WaitGroup
+	for i := 0; i < writes; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := executor.Execute(command.Command{
+				Name: "SET",
+				Args: []string{"group:" + strconv.Itoa(i), "durable"},
+			})
+			if err != nil {
+				errs <- err
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	if err := logFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered := storage.NewStore()
+	recoveredLog, err := Open(path, "always", recovered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recoveredLog.Close()
+	recoveredExecutor := command.NewExecutor(recovered)
+	for i := 0; i < writes; i++ {
+		got := execute(t, recoveredExecutor, "GET", "group:"+strconv.Itoa(i))
+		if got.Type != resp.BulkString || got.String != "durable" {
+			t.Errorf("recovered grouped write %d = %+v", i, got)
+		}
+	}
+}
+
 func TestAOFSubprocessCrashWriter(t *testing.T) {
 	path := os.Getenv("CARROT_AOF_CRASH_TEST_PATH")
 	if path == "" {
@@ -506,6 +589,7 @@ func TestAOFRewriteCompactsAndPreservesCurrentState(t *testing.T) {
 	if got := execute(t, executor, "AOFREWRITE"); got.Type != resp.SimpleString || got.String != "OK" {
 		t.Fatalf("AOFREWRITE response = %+v", got)
 	}
+	waitForAOFRewrite(t, executor)
 	afterInfo, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
@@ -559,6 +643,55 @@ func TestAOFRewriteCompactsAndPreservesCurrentState(t *testing.T) {
 	}
 	if len(tempFiles) != 0 {
 		t.Errorf("rewrite left temporary files behind: %v", tempFiles)
+	}
+}
+
+func TestAOFBackgroundRewriteIncludesWritesSinceSnapshot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "appendonly.aof")
+	store := storage.NewStore()
+	logFile, err := Open(path, "always", store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := command.NewExecutor(store)
+	executor.SetJournal(logFile)
+	execute(t, executor, "SET", "before", "snapshot")
+
+	snapshot, err := store.SnapshotEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready, err := logFile.StartRewrite(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execute(t, executor, "SET", "during", "rewrite")
+	execute(t, executor, "SET", "before", "updated")
+	if err := <-ready; err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+	if err := logFile.CompleteRewrite(); err != nil {
+		t.Fatalf("install snapshot and delta: %v", err)
+	}
+	if err := logFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered := storage.NewStore()
+	recoveredLog, err := Open(path, "always", recovered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recoveredLog.Close()
+	recoveredExecutor := command.NewExecutor(recovered)
+	for key, want := range map[string]string{
+		"before": "updated",
+		"during": "rewrite",
+	} {
+		got := execute(t, recoveredExecutor, "GET", key)
+		if got.Type != resp.BulkString || got.String != want {
+			t.Errorf("recovered GET %q = %+v, want %q", key, got, want)
+		}
 	}
 }
 

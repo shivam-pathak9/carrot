@@ -379,3 +379,17 @@ func (s *Store) ForEachSnapshot(visit func(SnapshotEntry) error) error {
 	}
 	return nil
 }
+
+// SnapshotEntries copies all current live values for point-in-time operations
+// that need to continue after releasing the caller's mutation barrier.
+func (s *Store) SnapshotEntries() ([]SnapshotEntry, error) {
+	entries := make([]SnapshotEntry, 0)
+	err := s.ForEachSnapshot(func(entry SnapshotEntry) error {
+		entries = append(entries, entry)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return entries, nil
+}

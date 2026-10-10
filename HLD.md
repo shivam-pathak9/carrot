@@ -5,9 +5,9 @@ This document describes the repository as it is implemented, not an intended
 future architecture. The implementation is the final authority when behavior
 and prose differ.
 
-For field-level structures, function responsibilities, lock ownership, and
-algorithm details, see [LLD.md](./LLD.md). The [README](./README.md) remains
-the concise user-facing feature and run guide.
+For the compact implementation map and synchronization details, see
+[LLD.md](./LLD.md). The [README](./README.md) remains the user-facing feature
+and run guide.
 
 ## 1. Purpose and boundaries
 
@@ -261,52 +261,51 @@ buffer before queuing bytes.
 ```mermaid
 flowchart TD
     Request["Executor.Execute(command)"] --> Special{"AOFREWRITE?"}
-    Special -->|yes| Barrier["writeMu.Lock"]
-    Barrier --> Rewrite["JournalRewriter.Rewrite(store)"]
-    Rewrite --> Unlock["unlock; return OK/error"]
+    Special -->|yes| RewriteQueue["queue rewrite request"]
+    RewriteQueue --> Capture["mutation barrier; copy snapshot"]
+    Capture --> Worker["serialize snapshot in background"]
     Special -->|no| Mut{"IsMutation(name)?"}
     Mut -->|no| Dispatch["execute handler"]
     Mut -->|yes| Journal{"Journal installed?"}
-    Journal -->|yes| Lock["writeMu.Lock"]
-    Lock --> Append["Append canonical command"]
+    Journal -->|yes| Queue["bounded write queue"]
+    Queue --> Batch["collect up to 64 commands"]
+    Batch --> Append["append canonical batch"]
     Journal -->|no| Dispatch
     Append --> Good{"append succeeded?"}
     Good -->|no| Error["return Go error; do not mutate"]
     Good -->|yes| Canonical["replace request with persisted command"]
     Canonical --> Dispatch
-    Dispatch --> LockHeld{"writeMu held?"}
-    LockHeld -->|yes| Unlock["unlock writeMu"]
-    LockHeld -->|no| Response["RESP value + optional error"]
-    Unlock --> Response
+    Append --> Apply["apply in journal order"]
+    Dispatch --> Response["RESP value + optional error"]
 ```
 
-Each server has one shared executor/store per process. When a journal is
-installed, `writeMu` serializes mutations across append and in-memory
-execution. This preserves the order between durable commands and resulting
-state and prevents writes during a rewrite snapshot. Without a journal,
-mutations rely on storage shard locks and can proceed concurrently for
-different shards. Reads also rely on shard locks. The standard server runs
-client handlers in separate goroutines; the reactor has one event-loop
-command-dispatch path and therefore processes commands sequentially regardless
-of AOF.
+Each server has one shared executor/store per process. With a batch-capable
+journal, mutations enter a bounded executor queue. One dispatcher gathers up
+to 64 ready requests (and, for `always`, waits at most 250 microseconds for
+more), appends the commands as one batch, then applies them in the same order
+under the mutation barrier. One `always` fsync therefore covers a batch rather
+than each write. Group commit reduces sync frequency, not the total ordering
+requirement. Without a journal, commands bypass the write queue and rely on
+storage shard locks. Reads use shard locks in either mode.
+
+The standard server runs client handlers in separate goroutines. The reactor
+dispatches commands synchronously from its single event loop, so command
+execution or a batch commit can delay other ready connections even though
+network I/O is readiness-driven.
 
 If persistence append fails, the executor returns before applying the
 mutation. With AOF disabled, the same command handlers still execute, but
 there is no restart durability.
 
-In the reactor, command dispatch is synchronous on the event-loop path. A
-mutation using `always` can block that loop during `file.Sync`; synchronous
-`AOFREWRITE` blocks it for the full rewrite. Other ready clients cannot be
-processed until the operation returns. The standard server's other client
-goroutines can continue to run, although journaled mutations queue on
-`writeMu`.
-
-`AOFREWRITE` holds the same mutation mutex for the complete synchronous
-rewrite. Mutations wait. In the standard goroutine server, read handlers can
-continue because they do not take that mutex. In the reactor, the rewrite is
-executed on the event-loop path, so the loop cannot serve reads until the
-rewrite returns. Once the new AOF is active, waiting mutations append to it
-and then update memory.
+`AOFREWRITE` is queued in the same ordering stream. The executor briefly
+holds the mutation barrier to copy a point-in-time snapshot, then returns
+while a worker serializes the copy. Mutations continue to append to the active
+AOF and are also written to a delta file. At installation, mutations pause
+while the delta is appended and the replacement is synced and renamed. The
+reactor can process other requests during snapshot serialization, but snapshot
+capture, final installation, or a slow command can still delay its event
+loop. See [AOF_PERSISTENCE.md](./docs/AOF_PERSISTENCE.md) for durability and
+failure details.
 
 ## 7. Storage and expiration
 
@@ -314,10 +313,10 @@ The in-memory store has 256 fixed shards. Each shard has a `sync.RWMutex` and
 a Go map from key to typed object. FNV-1a hashes a key to one shard. The
 documented intent is lock striping to allow unrelated keys to be accessed
 under different locks at the storage layer. Executor mutations without AOF
-can use this concurrency; when a journal is installed, `writeMu` serializes
-mutations to preserve journal order and rewrite consistency. The count is a
-constant in code; no workload-specific comparison of shard counts is
-implemented, so 256 is not claimed as optimal.
+can use this concurrency; with AOF, the executor write queue and mutation
+barrier preserve journal order. The count is a constant in code; no
+workload-specific comparison of shard counts is implemented, so 256 is not
+claimed as optimal.
 
 Current value kinds are string and list. Expiration is stored as an absolute
 `time.Time` deadline. Access methods perform passive expiration: an expired
@@ -335,15 +334,16 @@ not a hard real-time latency guarantee.
 
 ```mermaid
 flowchart LR
-    Mutation["Mutation request"] --> Serial["Executor writeMu"]
-    Serial --> Normalize["Canonicalize relative expiry"]
-    Normalize --> Encode["Encode one RESP command"]
-    Encode --> Append["Append + flush AOF"]
+    Mutation["Mutation request"] --> Queue["Executor write queue"]
+    Queue --> Group["Group ready mutations, max 64"]
+    Group --> Normalize["Canonicalize relative expiry"]
+    Normalize --> Encode["Encode ordered RESP records"]
+    Encode --> Append["Append + flush AOF batch"]
     Append --> Policy{"Sync policy"}
-    Policy -->|always| Sync["file.Sync per mutation"]
+    Policy -->|always| Sync["one file.Sync per batch"]
     Policy -->|everysec| Periodic["background periodic file.Sync"]
     Policy -->|no| NoSync["no periodic sync"]
-    Sync --> Apply["Apply canonical command to store"]
+    Sync --> Apply["Apply canonical commands in order"]
     Periodic --> Apply
     NoSync --> Apply
     Apply --> Ack["Send response"]
@@ -375,17 +375,13 @@ explicit unsupported-platform error.
 
 ### Rewrite / compaction
 
-`AOFREWRITE` streams the current live string/list snapshot to a temporary file
-in the AOF directory, locks the replacement, flushes and syncs it, atomically
-renames it over the configured path, syncs the parent directory, then changes
-the open log to the replacement. If snapshot writing fails before rename, the
-old AOF remains active. Mutations are held behind the executor barrier during
-this operation. Reads are not blocked by that mutex in the standard server;
-the reactor cannot process any request while its single event loop is occupied
-by the synchronous rewrite.
-
-Rewrite is manual and synchronous. It temporarily needs space for both files.
-There is no background copy-on-write rewrite, replication, automatic
+`AOFREWRITE` copies a point-in-time snapshot while holding the mutation
+barrier, then serializes the copied entries in a background worker. Writes
+continue and append to a sidecar delta until final installation takes the
+barrier, appends the delta, syncs and atomically renames the replacement, and
+syncs the parent directory. A large snapshot uses memory proportional to live
+data; a large delta can still make final installation noticeable. Rewrite is
+manual and requires temporary disk space. There is no replication, automatic
 compaction, AOF checksum, backup system, or protection from device failure.
 See [docs/AOF_PERSISTENCE.md](./docs/AOF_PERSISTENCE.md) for detailed recovery
 and failure behavior.
@@ -401,8 +397,8 @@ and failure behavior.
   default-on AOF remains Linux-only.
 - The reactor uses direct Linux syscalls and processes commands on its event
   loop. A slow command or storage operation can delay other ready connections.
-- The AOF's strongest sync mode can make writes more expensive due to
-  per-command file synchronization.
+- The AOF's strongest sync mode batches concurrent writes into a bounded
+  group-commit window; each batch still incurs one file synchronization.
 - Benchmarks are local observations, not capacity guarantees. The README's
   comparison disables AOF and does not represent durable-write throughput.
 
@@ -418,15 +414,15 @@ experimental proof that the choice is optimal.
 |---|---|---|---|
 | Two server modes | Go `net.Listener` server and Linux epoll reactor share parser, executor, store, and journal | Allows comparison of blocking per-connection I/O and readiness-driven I/O while keeping command semantics shared | More transport/lifecycle code to maintain. Local comparison exists, but cannot establish that either model is universally faster or production-preferable. |
 | Standard connection handling | One handler goroutine per accepted `net.Conn` | Keeps each connection's blocking read/decode/execute/write flow isolated and uses Go's standard networking API | Goroutines and connection state grow with client count; max connections is configured, but total process memory is not. TCP tests exist; high-connection scalability is not proven. |
-| Reactor execution | One event-loop path owns socket readiness, connection buffers, and synchronous command dispatch | Makes non-blocking reads, partial writes, and readiness transitions explicit | Slow commands, `always` AOF sync, and synchronous rewrite delay every ready connection on that loop. No workload evidence proves a general latency or throughput advantage. |
+| Reactor execution | One event-loop path owns socket readiness, connection buffers, and synchronous command dispatch | Makes non-blocking reads, partial writes, and readiness transitions explicit | Slow commands, `always` group commits, and rewrite snapshot/finalization barriers can delay every ready connection on that loop. No workload evidence proves a general latency or throughput advantage. |
 | Shared command core | Both transports use the same parser and executor | Avoids implementing command semantics twice | Transport-specific error, buffering, and timeout behavior still differ. Integration tests cover both paths. |
 | RESP request shape | Commands are arrays of bulk strings, normalized to `Command{Name, Args}` | Gives handlers a transport-independent representation and supports binary bulk arguments | It is a deliberately narrow subset, not complete Redis compatibility. Protocol tests validate implemented framing, not compatibility with every Redis client/command. |
 | Live state and persistence | In-memory typed store plus append-only command log replayed at startup | Keeps normal command execution in process while preserving a sequential recovery mechanism | Store memory is unbounded and replay duration grows with log size. Streaming replay avoids a whole-file allocation; there is no large-file benchmark or physical power-loss test matrix. |
-| Append-before-apply | Recognized mutations are serialized, journaled, then applied | A known append failure is returned before changing live state; the same order establishes journal/state ordering | A single write mutex serializes even unrelated-key mutations. Tests cover append failure and ordering; contention cost is not quantified for all policies. |
+| Append-before-apply | Mutations are queued, appended in bounded batches, then applied in journal order | A known append failure is returned before changing live state; the same order establishes journal/state ordering | Journaled mutation application remains serialized. `always` amortizes fsync over up to 64 commands, at the cost of up to 250 microseconds of batching delay. Tests cover append failure, batch grouping, and ordering; sustained contention cost is not yet characterized. |
 | Rejected command logging | A syntactically canonicalizable mutation is journaled before its handler runs, including commands that return RESP errors such as wrong-type list operations | Preserves append-before-apply without needing a separate validation/commit path | Rejected requests add AOF bytes but replay to the same data state. Safely excluding them requires an atomic command validation/commit design; executing first could leave unpersisted memory changes after an append failure. A regression test covers current behavior. |
 | AOF sync policies | `always`, `everysec`, and `no`; default is `everysec` | Exposes an explicit durability/performance tradeoff | Acknowledged-write loss windows depend on policy and OS/filesystem/device behavior. Tests verify code paths, not hardware power-loss guarantees. |
-| Synchronous rewrite | A mutation barrier protects a snapshot written to a same-directory temporary file and atomically renamed | Avoids a concurrent-write buffer and merge protocol; mutation order stays unambiguous | Mutations pause; the reactor cannot serve requests during rewrite, while standard-server reads can proceed. Correctness/failure tests exist; sustained-load impact is unmeasured. |
-| Sharded store | 256 fixed FNV-1a-routed shards, each with an `RWMutex` and map | Storage calls and executor mutations without AOF can proceed concurrently when they target different shards | With AOF enabled, `Executor.writeMu` serializes mutations for journal ordering and rewrite consistency. Hash collisions serialize unrelated keys; there is overhead per shard. No alternative-count benchmark proves 256 optimal. The central limit theorem is not a justification for this constant. |
+| Background rewrite | A mutation barrier captures a point-in-time copy; a worker serializes it while mutations append to a delta | Keeps long snapshot serialization outside the mutation pause while preserving a total journal order | Snapshot capture and final delta installation pause mutations; memory and disk use rise during the rewrite. Correctness/failure tests exist; sustained-load impact is unmeasured. |
+| Sharded store | 256 fixed FNV-1a-routed shards, each with an `RWMutex` and map | Storage calls and executor mutations without AOF can proceed concurrently when they target different shards | With AOF enabled, journal ordering serializes mutation application even though storage is sharded. Hash collisions serialize unrelated keys; there is overhead per shard. No alternative-count benchmark proves 256 optimal. The central limit theorem is not a justification for this constant. |
 | Expiration | Passive expiration on access plus sampled active sweeps | Access-time checks provide correct behavior for touched keys; sweeps reclaim expired keys not touched again | The sweep visits Go map entries in unspecified iteration order; it is not uniform random sampling and is eventual, not immediate. It returns a deletion count but server callers currently discard it; cleanup logs are aggregated at most once per minute per store. Tests cover expiration and log throttling, not all key distributions. |
 | Resource bounds | Limits apply to connections, messages, protocol fields, responses, and timeouts | Bounds specific, attacker-controlled input paths and limits slow/stalled connections | They do not cap aggregate memory, database size, or disk use. Boundary tests exist; total-memory exhaustion is not demonstrated safe. |
 | Bind default | Default listener is `0.0.0.0:6379`; wildcard startup is warned | Retains an all-interface default for the server's current configuration behavior | There is no authentication or TLS, so the default is unsafe on untrusted networks. Use loopback/firewalling for local or controlled deployment; a warning is not access control. |
@@ -464,8 +460,8 @@ power-loss durability, or behavior under sustained load.
 
 1. Read this document for component boundaries, lifecycle, and end-to-end
    flows.
-2. Read [LLD.md](./LLD.md) for structures, method responsibilities,
-   synchronization, and algorithm details.
+2. Read [LLD.md](./LLD.md) for the implementation map and key synchronization
+   boundaries.
 3. Read the package-specific AOF guide for the durability contract.
 4. Read `internal/reactor/ARCH.md` and `internal/reactor/README.md` for
    subsystem-level epoll detail; verify implementation claims against current

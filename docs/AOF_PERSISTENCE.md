@@ -19,9 +19,11 @@ Both server binaries accept:
 
 ## Durability contract
 
-- `always`: append and sync each mutating command before applying it in memory
-  or returning its response. This is the strongest local durability mode, but
-  adds an `fsync` to each write.
+- `always`: append and sync a bounded batch of mutations before applying any
+  of them or returning their responses. Concurrent writes may share one
+  `fsync`; the executor waits up to 250 microseconds to form a batch of at most
+  64 commands. A single write retains append-before-apply durability, with a
+  small batching delay.
 - `everysec` (default): append before applying a mutation and sync periodically.
   A process crash normally leaves appended data available to replay, but an OS
   crash or power loss can lose recently acknowledged writes that were not yet
@@ -58,21 +60,32 @@ executing first could change memory if the subsequent append fails.
 
 ## Current limitations
 
-Use `AOFREWRITE` to compact the log to the current live string and list values.
-The command is synchronous in this initial implementation: mutation commands
-wait while Carrot streams the snapshot, syncs a same-directory temporary file,
-and atomically renames it over the old AOF. Standard-server read handlers can
-continue; the reactor event loop cannot process requests until the rewrite
-returns. In reactor mode, an `always`-policy mutation also blocks the event
-loop while its per-command `file.Sync` runs. There is no group commit: `always`
-performs one sync per mutation. The replacement is locked before rename so
-another Carrot process cannot open it during the handoff. Mutations waiting
-for the rewrite are appended to the new file after the rewrite completes. Rewriting
-temporarily requires disk space for both the old log and the compacted
-replacement. If snapshot writing fails before rename, the original AOF remains
-in place; if syncing the directory
-after rename fails, the replacement is active but later writes are rejected
-until the server restarts and reopens the AOF.
+Use `AOFREWRITE` to start a background compaction and `AOFREWRITE STATUS` to
+inspect it. Start returns `+OK`; status returns a two-element array containing
+`queued`, `running`, `completed`, or `failed`, followed by an error message
+(empty unless the job failed). Only one rewrite may run at a time.
+
+The executor briefly orders a point-in-time snapshot against mutations, then
+the rewrite worker serializes that copy while writes continue. Concurrent
+mutations are appended to the active AOF and a temporary delta file. Before
+installation, the executor takes a mutation barrier, appends the delta to the
+replacement, syncs it, and atomically renames it over the old AOF. This reduces
+the pause from snapshot I/O to snapshot copying plus delta installation; a
+large accumulated delta can still make the final pause noticeable. Snapshot
+copying temporarily needs memory proportional to live database contents, and
+the old AOF, snapshot, and delta temporarily consume additional disk space.
+Carrot does not fork a child for rewrite: it trades copy-on-write process
+semantics for an explicit in-process snapshot and delta log, keeping rewrite
+errors and journal ownership in the existing process at the cost of that
+temporary memory copy.
+
+If snapshot or delta writing fails before rename, the original AOF remains in
+place and status reports failure. If syncing the directory after rename fails,
+the replacement is active but later writes are rejected until restart. The
+reactor event loop can continue processing while the snapshot is serialized,
+but requests that need a mutation barrier can wait during snapshot capture or
+final installation. With `always`, concurrent writes share one `fsync` when
+they arrive within the bounded group-commit window.
 
 Compaction reduces accumulated history but does not run automatically. There
 is no backup automation, replication, checksum, or disk-failure protection.
@@ -85,10 +98,11 @@ review.
 The implementation is split across a few focused files:
 
 - `internal/aof/aof.go` owns the AOF lifecycle and format: `Open` locks and
-  recovers the file; `Append` canonicalizes and writes one RESP command;
-  `Rewrite` writes and syncs a compact snapshot before atomically replacing the
-  old file; `rollback` removes a failed append and marks the log unhealthy if
-  recovery of the append itself fails; `syncLoop` implements `everysec`;
+  recovers the file; `AppendBatch` canonicalizes and writes ordered RESP
+  commands with one sync per batch under `always`; `StartRewrite`,
+  `CompleteRewrite`, and `AbortRewrite` implement background compaction;
+  `rollback` removes a failed append and marks the log unhealthy if recovery
+  of the append itself fails; `syncLoop` implements `everysec`;
   `Close` stops the sync loop, syncs, unlocks, and closes; `replay` streams
   records to reconstruct the store without buffering the entire AOF in memory.
 - `internal/aof/lock_linux.go` uses Linux `flock` to prevent concurrent Carrot
@@ -101,14 +115,13 @@ The implementation is split across a few focused files:
   truncation at every byte boundary of a final record, corrupt records,
   exclusive locking, sync policy, and failed appends.
 - `internal/command/executor.go` is the shared write boundary used by both
-  servers. It holds a mutex across append and in-memory execution, ensuring
-  journal order and state-change order agree. `AOFREWRITE` holds the same
-  mutex during compaction, so writes cannot slip between the snapshot and file
-  replacement; queued writes continue in the replacement log afterward.
-- `internal/storage/storage.go` provides `ForEachSnapshot`, which copies one
-  shard's live values at a time and releases storage locks before encoding.
-  This keeps rewrite from duplicating the entire dataset in an in-memory
-  snapshot.
+  servers. Its bounded write sequencer batches concurrent journal appends,
+  then applies them in journal order. Rewrite snapshot capture and final
+  installation use the mutation barrier; intervening writes are retained in
+  the rewrite delta and replayed after the snapshot.
+- `internal/storage/storage.go` provides `SnapshotEntries`, which copies the
+  live database for a point-in-time background rewrite. This temporarily uses
+  memory proportional to the live data set.
 - `internal/server/server.go` and `internal/reactor/server.go` open/replay
   persistence before accepting commands and close it during shutdown.
 
@@ -116,22 +129,20 @@ For a client mutation, the flow is:
 
 1. The server parses the RESP request into a command and calls the shared
    executor.
-2. The executor recognizes mutations, takes its write mutex, and calls the AOF
-   journal before changing storage.
-3. AOF converts relative expirations to absolute deadlines and appends the
-   RESP-encoded command. With `always`, it also syncs the file at this point.
-4. The executor applies the returned canonical command to memory and releases
-   the mutex. If append or required sync fails, storage is not mutated.
+2. The executor queues journaled mutations into an ordered batch. The batch
+   converts relative expirations to absolute deadlines and appends RESP records
+   before any mutation is applied. With `always`, one `fsync` covers the batch.
+3. The executor applies each returned canonical command in journal order. If
+   append or required sync fails, no command in the batch is applied.
 5. At startup, `Open` obtains the exclusive lock and `replay` applies complete
    records to a fresh store before the listener/event loop starts.
 
 The same executor path is used during replay with no journal attached, which
 prevents replayed commands from being appended again.
 
-During `AOFREWRITE`, the executor's mutation lock creates a barrier: current
-mutations finish first, then the store is streamed into a locked temporary
-file. After that file has been flushed and synced, rename atomically makes it
-the AOF at the configured path. The `Log` switches its append descriptor to
-the replacement before releasing the old file lock. Mutations that arrived
-while the barrier was held then append to the replacement, preventing lost
-writes across compaction.
+During `AOFREWRITE`, the executor's mutation barrier creates a point-in-time
+snapshot copy. A background worker writes the copy while concurrent mutations
+continue to append to the active AOF and delta file. At completion, journaled
+mutations pause while the delta is appended and the synced replacement is
+renamed into place. The `Log` switches its descriptor before releasing the old
+file lock, preserving writes across compaction.

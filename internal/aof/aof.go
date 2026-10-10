@@ -40,8 +40,22 @@ type Log struct {
 	done      chan struct{}
 	closeOnce sync.Once
 	closed    bool
+	closing   bool
 	failed    error
 	closeErr  error
+	rewrite   *rewriteJob
+}
+
+type rewriteJob struct {
+	tempPath    string
+	tempFile    *os.File
+	tempWriter  *bufio.Writer
+	deltaPath   string
+	deltaFile   *os.File
+	deltaWriter *bufio.Writer
+	ready       chan error
+	done        chan struct{}
+	deltaErr    error
 }
 
 // Open locks path, replays its commands into store, and returns an append-ready
@@ -110,96 +124,199 @@ func Open(path, policy string, store *storage.Store) (*Log, error) {
 	return logFile, nil
 }
 
-// Rewrite replaces the command history with commands that reconstruct the
-// current store. Call it through Executor.RewriteAOF so all mutation commands
-// wait until the new file is active. The replacement is written and synced to
-// a temporary file in the same directory, then atomically renamed over the
-// current AOF. The temporary file is locked before rename so another process
-// cannot open the replacement during the handoff.
-func (l *Log) Rewrite(store *storage.Store) (resultErr error) {
-	if store == nil {
-		return errors.New("storage store must not be nil")
-	}
-
+// StartRewrite prepares an asynchronously written snapshot. Mutations are
+// captured in a sidecar delta while the snapshot is written; the executor
+// installs the rewrite under its mutation barrier after ready reports success.
+func (l *Log) StartRewrite(entries []storage.SnapshotEntry) (<-chan error, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.closed || l.closing {
+		return nil, errors.New("AOF is closed")
+	}
+	if l.failed != nil {
+		return nil, fmt.Errorf("AOF is unhealthy: %w", l.failed)
+	}
+	if l.rewrite != nil {
+		return nil, errors.New("AOF rewrite already in progress")
+	}
+
+	directory := filepath.Dir(l.path)
+	tempFile, err := os.CreateTemp(directory, "."+filepath.Base(l.path)+".rewrite-*")
+	if err != nil {
+		return nil, fmt.Errorf("create AOF rewrite file: %w", err)
+	}
+	cleanupTemp := func() error {
+		return errors.Join(tempFile.Close(), os.Remove(tempFile.Name()))
+	}
+	if err := tempFile.Chmod(0o600); err != nil {
+		return nil, errors.Join(fmt.Errorf("set AOF rewrite file permissions: %w", err), cleanupTemp())
+	}
+	if err := lockFile(tempFile); err != nil {
+		return nil, errors.Join(fmt.Errorf("lock AOF rewrite file: %w", err), cleanupTemp())
+	}
+	deltaFile, err := os.CreateTemp(directory, "."+filepath.Base(l.path)+".delta-*")
+	if err != nil {
+		_ = unlockFile(tempFile)
+		return nil, errors.Join(fmt.Errorf("create AOF rewrite delta: %w", err), cleanupTemp())
+	}
+	if err := deltaFile.Chmod(0o600); err != nil {
+		_ = deltaFile.Close()
+		_ = os.Remove(deltaFile.Name())
+		_ = unlockFile(tempFile)
+		return nil, errors.Join(fmt.Errorf("set AOF rewrite delta permissions: %w", err), cleanupTemp())
+	}
+
+	job := &rewriteJob{
+		tempPath:    tempFile.Name(),
+		tempFile:    tempFile,
+		tempWriter:  bufio.NewWriterSize(tempFile, 64<<10),
+		deltaPath:   deltaFile.Name(),
+		deltaFile:   deltaFile,
+		deltaWriter: bufio.NewWriterSize(deltaFile, 64<<10),
+		ready:       make(chan error, 1),
+		done:        make(chan struct{}),
+	}
+	l.rewrite = job
+	go func() {
+		var snapshotErr error
+		for _, entry := range entries {
+			if err := writeSnapshotEntry(job.tempWriter, entry); err != nil {
+				snapshotErr = fmt.Errorf("write AOF rewrite snapshot: %w", err)
+				break
+			}
+		}
+		if snapshotErr == nil {
+			if err := job.tempWriter.Flush(); err != nil {
+				snapshotErr = fmt.Errorf("flush AOF rewrite snapshot: %w", err)
+			}
+		}
+		job.ready <- snapshotErr
+	}()
+	return job.ready, nil
+}
+
+// CompleteRewrite appends the captured mutation delta and atomically installs
+// the replacement. Call only after the snapshot worker is ready and while the
+// executor mutation barrier is held.
+func (l *Log) CompleteRewrite() (resultErr error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	job := l.rewrite
+	if job == nil {
+		return errors.New("AOF rewrite is not active")
+	}
+	defer func() {
+		if resultErr != nil {
+			resultErr = errors.Join(resultErr, l.cleanupRewriteLocked(job))
+		}
+		l.rewrite = nil
+		close(job.done)
+	}()
 	if l.closed {
 		return errors.New("AOF is closed")
 	}
 	if l.failed != nil {
 		return fmt.Errorf("AOF is unhealthy: %w", l.failed)
 	}
-
-	directory := filepath.Dir(l.path)
-	tempFile, err := os.CreateTemp(directory, "."+filepath.Base(l.path)+".rewrite-*")
-	if err != nil {
-		return fmt.Errorf("create AOF rewrite file: %w", err)
-	}
-	tempPath := tempFile.Name()
-	renamed := false
-	tempLocked := false
-	defer func() {
-		if renamed {
-			return
-		}
-		var unlockErr error
-		if tempLocked {
-			unlockErr = unlockFile(tempFile)
-		}
-		closeErr := tempFile.Close()
-		removeErr := os.Remove(tempPath)
-		resultErr = errors.Join(resultErr, unlockErr, closeErr, removeErr)
-	}()
-
-	if err := tempFile.Chmod(0o600); err != nil {
-		return fmt.Errorf("set AOF rewrite file permissions: %w", err)
-	}
-	if err := lockFile(tempFile); err != nil {
-		return fmt.Errorf("lock AOF rewrite file: %w", err)
-	}
-	tempLocked = true
-
-	writer := bufio.NewWriterSize(tempFile, 64<<10)
-	if err := store.ForEachSnapshot(func(entry storage.SnapshotEntry) error {
-		return writeSnapshotEntry(writer, entry)
-	}); err != nil {
-		return fmt.Errorf("write AOF rewrite snapshot: %w", err)
-	}
-	if err := writer.Flush(); err != nil {
-		return fmt.Errorf("flush AOF rewrite file: %w", err)
-	}
-	if err := tempFile.Sync(); err != nil {
-		return fmt.Errorf("sync AOF rewrite file: %w", err)
+	if job.deltaErr != nil {
+		return fmt.Errorf("record AOF rewrite delta: %w", job.deltaErr)
 	}
 	if err := l.writer.Flush(); err != nil {
 		l.failed = fmt.Errorf("flush current AOF before replacement: %w", err)
 		return l.failed
 	}
-	if err := os.Rename(tempPath, l.path); err != nil {
+	if err := job.deltaWriter.Flush(); err != nil {
+		return fmt.Errorf("flush AOF rewrite delta: %w", err)
+	}
+	if _, err := job.deltaFile.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("seek AOF rewrite delta: %w", err)
+	}
+	if _, err := io.Copy(job.tempWriter, job.deltaFile); err != nil {
+		return fmt.Errorf("append AOF rewrite delta: %w", err)
+	}
+	if err := job.tempWriter.Flush(); err != nil {
+		return fmt.Errorf("flush completed AOF rewrite: %w", err)
+	}
+	if err := job.tempFile.Sync(); err != nil {
+		return fmt.Errorf("sync completed AOF rewrite: %w", err)
+	}
+	if err := os.Rename(job.tempPath, l.path); err != nil {
 		return fmt.Errorf("atomically replace AOF: %w", err)
 	}
 
-	// The path now names the synced replacement, whose lock was acquired
-	// before rename. Switch future appends to it before releasing the old lock.
 	oldFile := l.file
-	l.file = tempFile
-	l.writer = bufio.NewWriter(tempFile)
-	renamed = true
-
+	l.file = job.tempFile
+	l.writer = bufio.NewWriter(job.tempFile)
+	job.tempFile = nil
 	directorySyncErr := syncDirectory(l.path)
 	if directorySyncErr != nil {
-		// The rename has happened, but without a durable directory entry we
-		// cannot safely acknowledge later writes against the replacement path.
 		l.failed = fmt.Errorf("sync AOF directory after replacement: %w", directorySyncErr)
 		log.Printf("AOF rewrite directory sync failed: %v", directorySyncErr)
 	}
 	unlockErr := unlockFile(oldFile)
 	closeErr := oldFile.Close()
+	deltaCloseErr := job.deltaFile.Close()
+	deltaRemoveErr := os.Remove(job.deltaPath)
+	job.deltaFile = nil
 	return errors.Join(
 		wrapIfError(directorySyncErr, "sync AOF directory after replacement"),
 		wrapIfError(unlockErr, "unlock replaced AOF"),
 		wrapIfError(closeErr, "close replaced AOF"),
+		wrapIfError(deltaCloseErr, "close AOF rewrite delta"),
+		wrapIfError(deltaRemoveErr, "remove AOF rewrite delta"),
 	)
+}
+
+// AbortRewrite removes an unfinished replacement while leaving the active AOF
+// untouched.
+func (l *Log) AbortRewrite(cause error) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.rewrite == nil {
+		return nil
+	}
+	job := l.rewrite
+	l.rewrite = nil
+	cleanupErr := l.cleanupRewriteLocked(job)
+	close(job.done)
+	return errors.Join(cause, cleanupErr)
+}
+
+func (l *Log) cleanupRewriteLocked(job *rewriteJob) error {
+	var errs []error
+	if job.tempFile != nil {
+		errs = append(errs, unlockFile(job.tempFile), job.tempFile.Close())
+	}
+	if job.deltaFile != nil {
+		errs = append(errs, job.deltaFile.Close())
+	}
+	errs = append(errs, removeRewriteFile(job.tempPath), removeRewriteFile(job.deltaPath))
+	return errors.Join(errs...)
+}
+
+func removeRewriteFile(path string) error {
+	err := os.Remove(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+// Rewrite keeps the synchronous journal API for callers that need to wait for
+// completion. Server commands use StartRewrite and report status instead.
+func (l *Log) Rewrite(store *storage.Store) error {
+	entries, err := store.SnapshotEntries()
+	if err != nil {
+		return err
+	}
+	ready, err := l.StartRewrite(entries)
+	if err != nil {
+		return err
+	}
+	if err := <-ready; err != nil {
+		return l.AbortRewrite(err)
+	}
+	return l.CompleteRewrite()
 }
 
 // writeSnapshotEntry serializes one current key as ordinary replayable
@@ -277,47 +394,85 @@ func wrapIfError(err error, operation string) error {
 	return fmt.Errorf("%s: %w", operation, err)
 }
 
-// Append writes a command as one RESP array and returns the exact command that
-// the executor should apply. Relative expirations are converted to absolute
-// deadlines so replay never renews their lifetime. A valid persisted command
-// is flushed to the OS before it is applied in memory; "always" additionally
-// syncs the file before returning. Commands that cannot be canonicalized are
-// passed through without being journaled, allowing the command executor to
-// produce its normal command-level response without recording malformed input.
+// Append writes one command through the batch append path.
 func (l *Log) Append(cmd command.Command) (command.Command, error) {
-	persisted, ok := canonicalCommand(cmd, time.Now())
-	if !ok {
-		return cmd, nil
+	results, err := l.AppendBatch([]command.Command{cmd})
+	if err != nil {
+		return command.Command{}, err
+	}
+	return results[0], nil
+}
+
+// GroupCommitDelay allows concurrent always-sync writes to join a bounded
+// 250-microsecond commit window. Other policies batch requests already queued
+// without adding an intentional wait.
+func (l *Log) GroupCommitDelay() time.Duration {
+	if l.policy == "always" {
+		return 250 * time.Microsecond
+	}
+	return 0
+}
+
+// AppendBatch canonicalizes, appends, and syncs a batch as one journal
+// transaction. Any append or required sync failure rolls the complete batch
+// back before the executor applies any mutation.
+func (l *Log) AppendBatch(commands []command.Command) ([]command.Command, error) {
+	persisted := make([]command.Command, len(commands))
+	valid := make([]bool, len(commands))
+	for i, cmd := range commands {
+		canonical, ok := canonicalCommand(cmd, time.Now())
+		if ok {
+			persisted[i] = canonical
+			valid[i] = true
+		} else {
+			persisted[i] = cmd
+		}
 	}
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.closed {
-		return command.Command{}, errors.New("AOF is closed")
+	if l.closed || l.closing {
+		return nil, errors.New("AOF is closed")
 	}
 	if l.failed != nil {
-		return command.Command{}, fmt.Errorf("AOF is unhealthy: %w", l.failed)
+		return nil, fmt.Errorf("AOF is unhealthy: %w", l.failed)
+	}
+	if len(commands) == 0 {
+		return persisted, nil
 	}
 	offset, err := l.file.Seek(0, io.SeekCurrent)
 	if err != nil {
 		l.failed = err
-		return command.Command{}, fmt.Errorf("get AOF append offset: %w", err)
+		return nil, fmt.Errorf("get AOF append offset: %w", err)
 	}
-
-	args := make([]resp.Value, 1, len(persisted.Args)+1)
-	args[0] = resp.NewBulkString(persisted.Name)
-	for _, arg := range persisted.Args {
-		args = append(args, resp.NewBulkString(arg))
+	written := 0
+	for i, cmd := range persisted {
+		if !valid[i] {
+			continue
+		}
+		if err := writeRecord(l.writer, cmd); err != nil {
+			return nil, l.rollback(offset, fmt.Errorf("encode AOF command %s: %w", cmd.Name, err))
+		}
+		written++
 	}
-	if err := resp.NewEncoder(l.writer).Encode(resp.NewArray(args...)); err != nil {
-		return command.Command{}, l.rollback(offset, fmt.Errorf("encode AOF command: %w", err))
+	if written > 0 {
+		if err := l.writer.Flush(); err != nil {
+			return nil, l.rollback(offset, fmt.Errorf("append AOF command batch: %w", err))
+		}
 	}
-	if err := l.writer.Flush(); err != nil {
-		return command.Command{}, l.rollback(offset, fmt.Errorf("append AOF command: %w", err))
-	}
-	if l.policy == "always" {
+	if written > 0 && l.policy == "always" {
 		if err := l.file.Sync(); err != nil {
-			return command.Command{}, l.rollback(offset, fmt.Errorf("sync AOF command: %w", err))
+			return nil, l.rollback(offset, fmt.Errorf("sync AOF command batch: %w", err))
+		}
+	}
+	if job := l.rewrite; job != nil && job.deltaErr == nil {
+		for i, cmd := range persisted {
+			if valid[i] {
+				if err := writeRecord(job.deltaWriter, cmd); err != nil {
+					job.deltaErr = err
+					break
+				}
+			}
 		}
 	}
 	return persisted, nil
@@ -351,6 +506,13 @@ func (l *Log) Close() error {
 		if l.policy == "everysec" {
 			close(l.stop)
 			<-l.done
+		}
+		l.mu.Lock()
+		l.closing = true
+		rewrite := l.rewrite
+		l.mu.Unlock()
+		if rewrite != nil {
+			<-rewrite.done
 		}
 		l.mu.Lock()
 		defer l.mu.Unlock()

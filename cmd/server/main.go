@@ -11,12 +11,14 @@ import (
 	"time"
 
 	"github.com/shivam-pathak9/carrot/internal/config"
+	"github.com/shivam-pathak9/carrot/internal/cpuprofile"
 	"github.com/shivam-pathak9/carrot/internal/server"
 )
 
 // main loads flags, starts the TCP server, and shuts it down on SIGINT or SIGTERM.
 func main() {
 	cfg := config.DefaultConfig()
+	var cpuProfile string
 	flag.StringVar(&cfg.Host, "host", cfg.Host, "TCP address to bind")
 	flag.StringVar(&cfg.Port, "port", cfg.Port, "TCP port to bind")
 	flag.IntVar(&cfg.MaxConnections, "max-connections", cfg.MaxConnections, "maximum simultaneous client connections")
@@ -27,6 +29,7 @@ func main() {
 	flag.BoolVar(&cfg.AOFEnabled, "aof-enabled", cfg.AOFEnabled, "enable append-only persistence")
 	flag.StringVar(&cfg.AOFPath, "aof-file", cfg.AOFPath, "append-only persistence file")
 	flag.StringVar(&cfg.AOFSyncPolicy, "aof-sync", cfg.AOFSyncPolicy, "AOF sync policy: always, everysec, or no")
+	flag.StringVar(&cpuProfile, "cpu-profile", "", "write a Go CPU profile to this file")
 	flag.Parse()
 
 	if err := cfg.Validate(); err != nil {
@@ -35,6 +38,15 @@ func main() {
 	if config.IsWildcardHost(cfg.Host) {
 		log.Printf("WARNING: listening on all network interfaces without authentication or TLS")
 	}
+	stopProfile, err := cpuprofile.Start(cpuProfile)
+	if err != nil {
+		log.Fatalf("start CPU profile: %v", err)
+	}
+	defer func() {
+		if err := stopProfile(); err != nil {
+			log.Printf("stop CPU profile: %v", err)
+		}
+	}()
 
 	srv := server.NewServer(cfg)
 	serveErr := make(chan error, 1)

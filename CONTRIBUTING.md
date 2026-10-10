@@ -21,13 +21,16 @@ go test -run '^$' -bench . ./internal/storage
 
 The storage package's `BenchmarkStoreParallelSetGet` measures direct
 concurrent store calls. `BenchmarkExecutorParallelSetGet` measures concurrent
-commands with AOF disabled; this bypasses the journal-ordering mutex but uses
-the same sharded store. Both use the existing 256-shard configuration and do
-not compare shard counts.
+commands with AOF disabled; this bypasses the journaled write sequencer but
+uses the same sharded store. Both use the existing 256-shard configuration
+and do not compare shard counts.
 
 The network-level comparison is available with `make benchmark`. It requires
-`redis-cli` and `redis-benchmark`, binds only to loopback, and disables AOF;
-report the host and benchmark settings with any results.
+`redis-server`, `redis-cli`, and `redis-benchmark`, binds only to loopback, and
+disables persistence; report the host and benchmark settings with any results.
+Use `BENCH_CPU_PROFILE_DIR=/tmp/carrot-pprof` for diagnostic Carrot CPU
+profiles. Profiling affects throughput, so do not report profiled numbers as
+benchmark results.
 
 ## Implementation and tests
 
