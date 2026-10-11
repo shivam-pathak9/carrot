@@ -13,6 +13,7 @@
   <a href="https://github.com/shivam-pathak9/carrot/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/shivam-pathak9/carrot/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="Go 1.26" src="https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white">
   <img alt="Tests" src="https://img.shields.io/badge/tests-180-brightgreen">
+  <a href="https://deepwiki.com/shivam-pathak9/carrot"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
   <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
 </p>
 
