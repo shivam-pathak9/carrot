@@ -5,9 +5,8 @@ This document describes the repository as it is implemented, not an intended
 future architecture. The implementation is the final authority when behavior
 and prose differ.
 
-For the compact implementation map and synchronization details, see
-[LLD.md](./LLD.md). The [README](./README.md) remains the user-facing feature
-and run guide.
+For the implementation map, synchronization details, tests and benchmark
+numbers, see [LLD.md](./LLD.md). The [README](./README.md) is the short tour.
 
 ## 1. Purpose and boundaries
 
@@ -58,11 +57,10 @@ internal/
   client/             Buffered RESP I/O adapter used by the Go server
   server/             Standard TCP server and goroutine client lifecycle
   reactor/            Linux epoll poller, connections, event loop, server
-docs/                 Persistence contract, scope, testing and review notes
-scripts/              Reproducible local network benchmark script
+scripts/              Benchmark, E2E harness and demo scripts
 ```
 
-The two production-style server binaries are `cmd/server` and
+The two server binaries are `cmd/server` and
 `cmd/reactor-server`. They create independent stores and executors and use the
 same `config`, `command`, `storage`, `aof`, and RESP implementations. The
 reactor uses direct file-descriptor I/O; it does not use `internal/client`.
@@ -304,8 +302,7 @@ AOF and are also written to a delta file. At installation, mutations pause
 while the delta is appended and the replacement is synced and renamed. The
 reactor can process other requests during snapshot serialization, but snapshot
 capture, final installation, or a slow command can still delay its event
-loop. See [AOF_PERSISTENCE.md](./docs/AOF_PERSISTENCE.md) for durability and
-failure details.
+loop. See section 8 for durability and failure details.
 
 ## 7. Storage and expiration
 
@@ -408,8 +405,24 @@ syncs the parent directory. A large snapshot uses memory proportional to live
 data; a large delta can still make final installation noticeable. Rewrite is
 manual and requires temporary disk space. There is no replication, automatic
 compaction, AOF checksum, backup system, or protection from device failure.
-See [docs/AOF_PERSISTENCE.md](./docs/AOF_PERSISTENCE.md) for detailed recovery
-and failure behavior.
+
+Failure behavior in short: if the snapshot or delta write fails before the
+rename, the old AOF stays in place and `AOFREWRITE STATUS` reports `failed`.
+If syncing the directory after the rename fails, the replacement is active but
+later writes are rejected until restart. A periodic sync failure is logged and
+also rejects later writes; reads keep working. `AOFREWRITE STATUS` returns
+`queued`, `running`, `completed` or `failed` plus an error string, and only one
+rewrite runs at a time. Carrot does not fork for rewrite; it trades
+copy-on-write for an in-process snapshot and delta, at the cost of temporary
+memory proportional to the live data.
+
+Lazy-expiry deletes are not journaled (replay drops them through the absolute
+deadline) while active-expiry and eviction deletes are, as `DEL` before removal.
+Recovery streams records, so memory use is bounded by the decoder and one
+record. The AOF only holds string and list mutations; a command that turns out
+to be a no-op or a wrong-type error can still be recorded, because the append
+has to happen before the command runs. Replay yields the same data, but those
+records grow the file until the next rewrite.
 
 ## 9. Observability, safety and known tradeoffs
 
@@ -424,7 +437,7 @@ and failure behavior.
   loop. A slow command or storage operation can delay other ready connections.
 - The AOF's strongest sync mode batches concurrent writes into a bounded
   group-commit window; each batch still incurs one file synchronization.
-- Benchmarks are local observations, not capacity guarantees. The README's
+- Benchmarks are local observations, not capacity guarantees. The LLD's
   comparison disables AOF and does not represent durable-write throughput.
 
 ## 10. Design choices: intent, tradeoffs, and evidence
@@ -477,19 +490,24 @@ ports that respond like a Redis server, and disables AOF for the comparison.
 
 The repository includes unit tests and TCP tests for both server modes,
 storage behavior, RESP handling, command behavior, and AOF recovery/rewrite.
-Coverage and gaps are recorded in [docs/TEST_SUMMARY.md](./docs/TEST_SUMMARY.md).
+Coverage and gaps are recorded in the [LLD](./LLD.md#testing).
 Passing tests do not establish production safety, full Redis compatibility,
 power-loss durability, or behavior under sustained load.
 
-## 12. Reading path
+## 12. Scope and roadmap
 
-1. Read this document for component boundaries, lifecycle, and end-to-end
-   flows.
-2. Read [LLD.md](./LLD.md) for the implementation map and key synchronization
-   boundaries.
-3. Read the package-specific AOF guide for the durability contract.
-4. Read `internal/reactor/ARCH.md` and `internal/reactor/README.md` for
-   subsystem-level epoll detail; verify implementation claims against current
-   Go code.
-5. Read the README for commands, local setup, current benchmark results, and
-   production-readiness boundaries.
+Out of scope unless the project goal changes: replication, clustering,
+Lua scripting, pub/sub, transactions, ACLs and TLS, and the RDB snapshot
+format. Blocking list commands and the `volatile-*` eviction policies are also
+not implemented.
+
+| Phase | State |
+|---|---|
+| Scope and evidence | Done: supported commands, baselines and limits are written down |
+| Safe operation | Done: config validation, connection/request/response limits, deadlines, graceful shutdown, TCP tests. The `0.0.0.0` default is kept on purpose and logs a warning |
+| Durability | AOF replay, group commit, background rewrite and a SIGKILL harness are in. Fault injection (failed write/fsync), power-loss validation and backups are not |
+| Correctness under stress | Race tests, rewrite serialization tests, a CI fuzz smoke run and repeatable benchmarks are in. Long fuzzing and sustained-load testing are not |
+| Operations | Not started: structured logs, health checks, metrics, deployment guidance |
+
+Next candidates: more data types (hashes, sets), reducing reactor syscall and
+allocation overhead, and `volatile-*` eviction policies.

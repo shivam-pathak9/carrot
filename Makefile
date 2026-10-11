@@ -1,4 +1,4 @@
-.PHONY: build test test-race test-e2e cover vet fmt-check check benchmark
+.PHONY: build test test-race test-e2e cover vet fmt-check check benchmark demo demo-scale
 
 build:
 	go build ./...
@@ -28,3 +28,11 @@ benchmark:
 	@command -v redis-benchmark >/dev/null || \
 		(echo "redis-benchmark is required (Redis CLI tools)" >&2; exit 1)
 	./scripts/benchmark.sh
+
+demo:
+	@command -v redis-cli >/dev/null || \
+		(echo "redis-cli is required" >&2; exit 1)
+	./scripts/demo.sh
+
+demo-scale:
+	python3 scripts/demo_scale.py
