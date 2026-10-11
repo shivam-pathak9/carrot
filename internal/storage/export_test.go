@@ -13,4 +13,9 @@ func (s *Store) setRawObj(key string, obj Obj) {
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	sh.data[key] = obj
+	if obj.ExpiresAt.IsZero() {
+		sh.untrackTTL(key)
+	} else {
+		sh.trackTTL(key)
+	}
 }

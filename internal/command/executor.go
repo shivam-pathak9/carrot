@@ -121,6 +121,54 @@ func (e *Executor) Execute(cmd Command) (resp.Value, error) {
 	return e.execute(cmd)
 }
 
+// ActiveExpire runs one active-expiry cycle and returns the number of keys
+// deleted. Without a journal it deletes expired keys directly. With a journal,
+// each batch of expired keys is re-checked and a DEL for each is persisted
+// before the keys are removed, under the mutation lock so a concurrent write
+// cannot be overtaken by a stale delete. Lazy expiry on reads is not
+// journaled; replay re-applies absolute PEXPIREAT deadlines for those.
+func (e *Executor) ActiveExpire() int {
+	if e.journal == nil {
+		return e.store.ActiveExpireCycle()
+	}
+	return e.store.ActiveExpireCycleWith(e.journalAndDeleteExpired)
+}
+
+func (e *Executor) journalAndDeleteExpired(candidates []string) (int, error) {
+	e.mutationMu.Lock()
+	defer e.mutationMu.Unlock()
+
+	// Journal may have been removed during shutdown.
+	journal := e.journal
+	if journal == nil {
+		return e.store.DeleteExpired(candidates), nil
+	}
+
+	expired := e.store.FilterExpired(candidates)
+	if len(expired) == 0 {
+		return 0, nil
+	}
+	commands := make([]Command, len(expired))
+	for i, key := range expired {
+		commands[i] = Command{Name: "DEL", Args: []string{key}}
+	}
+
+	var err error
+	if batch, ok := journal.(BatchJournal); ok {
+		_, err = batch.AppendBatch(commands)
+	} else {
+		for _, cmd := range commands {
+			if _, err = journal.Append(cmd); err != nil {
+				break
+			}
+		}
+	}
+	if err != nil {
+		return 0, fmt.Errorf("persist expiry deletes: %w", err)
+	}
+	return e.store.DeleteExpired(expired), nil
+}
+
 // RewriteAOF starts a rewrite and waits for it to finish. Network commands use
 // the asynchronous AOFREWRITE command and query AOFREWRITE STATUS instead.
 func (e *Executor) RewriteAOF() error {

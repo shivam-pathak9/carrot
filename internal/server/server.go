@@ -42,6 +42,7 @@ type Server struct {
 	stopOnce          sync.Once
 	serveDone         chan struct{}
 	clientsWg         sync.WaitGroup
+	expireWg          sync.WaitGroup
 }
 
 // NewServer creates a server with fresh in-memory storage and initialized handlers.
@@ -145,6 +146,7 @@ func (s *Server) Serve(listener net.Listener) error {
 	}()
 
 	log.Printf("Carrot listening on %s", listener.Addr())
+	s.expireWg.Add(1)
 	go s.startActiveExpireLoop()
 
 	for {
@@ -257,6 +259,8 @@ func (s *Server) openPersistence() error {
 // closePersistence removes the journal from the executor and closes the AOF.
 // It is safe to call when AOF is disabled or was never successfully opened.
 func (s *Server) closePersistence() error {
+	// The expiry loop journals deletes, so it must stop before the AOF closes.
+	s.expireWg.Wait()
 	s.aofMu.Lock()
 	defer s.aofMu.Unlock()
 	if s.aof == nil {
@@ -269,12 +273,13 @@ func (s *Server) closePersistence() error {
 }
 
 func (s *Server) startActiveExpireLoop() {
+	defer s.expireWg.Done()
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			s.store.ActiveExpireCycle()
+			s.executor.ActiveExpire()
 		case <-s.stopChan:
 			return
 		}

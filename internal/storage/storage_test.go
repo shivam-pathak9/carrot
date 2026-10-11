@@ -616,3 +616,63 @@ func TestActiveExpirationLogsAreRateLimitedAndAggregated(t *testing.T) {
 		t.Fatalf("reports do not contain expected aggregated counts: %q", got)
 	}
 }
+
+func TestActiveExpireReachesExpiredKeysAmongManyLongTTLs(t *testing.T) {
+	store := NewStore()
+	for i := 0; i < 5000; i++ {
+		store.Set(fmt.Sprintf("long-%d", i), "v", time.Hour)
+	}
+	for i := 0; i < 5000; i++ {
+		store.SetAt(fmt.Sprintf("old-%d", i), "v", time.Now().Add(30*time.Millisecond))
+	}
+	for i := 0; i < 5000; i++ {
+		store.Set(fmt.Sprintf("persist-%d", i), "v", 0)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	// Each cycle stops once under 25% of a sample is expired, so the tail
+	// is removed slowly; require the bulk to be reached despite 10000 other
+	// volatile or persistent keys.
+	total := 0
+	for cycle := 0; cycle < 1000; cycle++ {
+		total += store.ActiveExpireCycle()
+	}
+	if total < 4500 {
+		t.Fatalf("active expiry removed only %d of 5000 expired keys", total)
+	}
+	if _, ok := store.getRawObj("long-1"); !ok {
+		t.Fatal("long-TTL key was removed")
+	}
+	if _, ok := store.getRawObj("persist-1"); !ok {
+		t.Fatal("persistent key was removed")
+	}
+}
+
+func TestTTLIndexStaysConsistent(t *testing.T) {
+	store := NewStore()
+	store.Set("a", "v", time.Hour)
+	store.Set("a", "v", 0) // overwritten as persistent
+	store.Set("b", "v", time.Hour)
+	store.Del("b")
+	store.Set("c", "v", time.Hour)
+	store.ExpireAt("c", time.Now().Add(2*time.Hour))
+	store.SetAt("d", "v", time.Now().Add(time.Hour))
+	store.Expire("d", 0) // deletes
+
+	count := 0
+	for i := range store.shards {
+		sh := &store.shards[i]
+		if len(sh.ttlKeys) != len(sh.ttlPos) {
+			t.Fatalf("shard %d: ttlKeys=%d ttlPos=%d", i, len(sh.ttlKeys), len(sh.ttlPos))
+		}
+		for pos, key := range sh.ttlKeys {
+			if sh.ttlPos[key] != pos {
+				t.Fatalf("shard %d: position mismatch for %q", i, key)
+			}
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("tracked %d TTL keys, want only c", count)
+	}
+}

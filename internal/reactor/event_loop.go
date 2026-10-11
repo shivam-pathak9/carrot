@@ -145,8 +145,8 @@ func (el *EventLoop) Run() error {
 		}
 
 		// Active Expiration: Purge expired keys proactively in the event loop thread
-		if el.store != nil {
-			el.store.ActiveExpireCycle()
+		if el.executor != nil {
+			el.executor.ActiveExpire()
 		}
 		el.expireConnections()
 	}

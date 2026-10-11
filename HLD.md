@@ -320,9 +320,18 @@ claimed as optimal.
 
 Current value kinds are string and list. Expiration is stored as an absolute
 `time.Time` deadline. Access methods perform passive expiration: an expired
-entry is deleted when read/updated. `ActiveExpireCycle` samples volatile
-entries and deletes expired keys in bounded passes so keys never accessed by
-clients can eventually be reclaimed.
+entry is deleted when read/updated. Each shard keeps an index of keys that may
+carry a TTL, so active expiry samples only volatile keys (starting at a random
+shard and offset) and deletes expired ones in bounded passes; keys never
+accessed by clients are eventually reclaimed. Sampling takes a few consecutive
+index entries per shard, so it is randomized but not a uniform random sample.
+
+With an AOF enabled, `Executor.ActiveExpire` re-checks each batch of expired
+candidates under the mutation lock, persists a `DEL` for each, and only then
+removes them, so a key overwritten after sampling is never deleted. Lazy
+expiry on reads is not journaled: replay re-applies absolute `PEXPIREAT`
+deadlines, which gives the same result unless the wall clock moves backwards
+between crash and restart.
 
 The standard server calls active expiration from a 100 ms ticker. The reactor
 calls it in the event-loop after each event batch; its wait timeout also lets

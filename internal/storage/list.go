@@ -140,7 +140,7 @@ func (l *listValue) index(index int64) (int, bool) {
 func (s *Store) liveObjectLocked(sh *shard, key string) (Obj, bool) {
 	obj, exists := sh.data[key]
 	if exists && obj.IsExpired(time.Now()) {
-		delete(sh.data, key)
+		sh.remove(key)
 		return Obj{}, false
 	}
 	return obj, exists
@@ -209,7 +209,7 @@ func (s *Store) ListPop(key string, left bool, count int64) ([]string, error) {
 		values = append(values, value)
 	}
 	if obj.list.Len() == 0 {
-		delete(sh.data, key)
+		sh.remove(key)
 	} else {
 		sh.data[key] = obj
 	}
@@ -333,7 +333,7 @@ func (s *Store) ListTrim(key string, start, stop int64) error {
 		stop = length - 1
 	}
 	if length == 0 || start >= length || start > stop {
-		delete(sh.data, key)
+		sh.remove(key)
 		return nil
 	}
 	obj.list.replace(obj.list.rangeCopy(int(start), int(stop+1)))
@@ -381,7 +381,7 @@ func (s *Store) ListRem(key string, count int64, value string) (int64, error) {
 		}
 	}
 	if obj.list.Len() == 0 {
-		delete(sh.data, key)
+		sh.remove(key)
 	} else {
 		sh.data[key] = obj
 	}
@@ -520,7 +520,7 @@ func (s *Store) listMoveLocked(srcShard, dstShard *shard, src, dst string, fromL
 		destination.list.push(value, toLeft)
 	}
 	if source.list.Len() == 0 {
-		delete(srcShard.data, src)
+		srcShard.remove(src)
 	} else {
 		srcShard.data[src] = source
 	}

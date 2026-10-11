@@ -833,3 +833,44 @@ func TestAOFRewriteDoesNotLoseConcurrentWrites(t *testing.T) {
 		}
 	}
 }
+
+func TestAOFActiveExpireJournalsDelAndReplays(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "appendonly.aof")
+	store := storage.NewStore()
+	logFile, err := Open(path, "always", store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := command.NewExecutor(store)
+	executor.SetJournal(logFile)
+	execute(t, executor, "SET", "gone", "v", "PX", "30")
+	execute(t, executor, "SET", "kept", "v")
+	time.Sleep(60 * time.Millisecond)
+
+	if got := executor.ActiveExpire(); got != 1 {
+		t.Fatalf("ActiveExpire deleted %d keys, want 1", got)
+	}
+	if err := logFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "DEL") {
+		t.Fatalf("AOF should contain a DEL for the expired key, got %q", data)
+	}
+
+	recovered := storage.NewStore()
+	recoveredLog, err := Open(path, "always", recovered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recoveredLog.Close()
+	if _, ok := recovered.Get("gone"); ok {
+		t.Fatal("expired key reappeared after replay")
+	}
+	if v, ok := recovered.Get("kept"); !ok || v != "v" {
+		t.Fatalf("kept = %q, %v", v, ok)
+	}
+}

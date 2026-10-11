@@ -3,6 +3,7 @@ package storage
 
 import (
 	"log"
+	"math/rand/v2"
 	"sync"
 	"time"
 )
@@ -50,6 +51,43 @@ const numShards = 256
 type shard struct {
 	mu   sync.RWMutex
 	data map[string]Obj
+
+	// ttlKeys lists keys that may carry an expiration so active expiry can
+	// sample volatile keys in O(1) without scanning persistent ones. ttlPos maps
+	// each tracked key to its slice index. Entries can be stale (the key was
+	// overwritten as persistent); sampling discards them.
+	ttlKeys []string
+	ttlPos  map[string]int
+}
+
+func (sh *shard) trackTTL(key string) {
+	if sh.ttlPos == nil {
+		sh.ttlPos = make(map[string]int)
+	}
+	if _, ok := sh.ttlPos[key]; ok {
+		return
+	}
+	sh.ttlPos[key] = len(sh.ttlKeys)
+	sh.ttlKeys = append(sh.ttlKeys, key)
+}
+
+func (sh *shard) untrackTTL(key string) {
+	pos, ok := sh.ttlPos[key]
+	if !ok {
+		return
+	}
+	last := len(sh.ttlKeys) - 1
+	moved := sh.ttlKeys[last]
+	sh.ttlKeys[pos] = moved
+	sh.ttlPos[moved] = pos
+	sh.ttlKeys = sh.ttlKeys[:last]
+	delete(sh.ttlPos, key)
+}
+
+// remove deletes key and its TTL index entry. The caller holds sh.mu.
+func (sh *shard) remove(key string) {
+	delete(sh.data, key)
+	sh.untrackTTL(key)
 }
 
 // Store is the in-memory typed key-value database used by Carrot. Its shard
@@ -115,6 +153,11 @@ func (s *Store) Set(key string, value string, ttl time.Duration) {
 		ExpiresAt: expiresAt,
 		Kind:      StringKind,
 	}
+	if expiresAt.IsZero() {
+		sh.untrackTTL(key)
+	} else {
+		sh.trackTTL(key)
+	}
 }
 
 // SetAt stores a string with an absolute expiration deadline. A deadline that
@@ -125,7 +168,7 @@ func (s *Store) SetAt(key, value string, expiresAt time.Time) {
 	defer sh.mu.Unlock()
 
 	if !time.Now().Before(expiresAt) {
-		delete(sh.data, key)
+		sh.remove(key)
 		return
 	}
 	sh.data[key] = Obj{
@@ -133,6 +176,7 @@ func (s *Store) SetAt(key, value string, expiresAt time.Time) {
 		ExpiresAt: expiresAt,
 		Kind:      StringKind,
 	}
+	sh.trackTTL(key)
 }
 
 // Get returns the stored value for key if it still exists and has not expired.
@@ -163,7 +207,7 @@ func (s *Store) TTL(key string) int64 {
 	now := time.Now()
 	// Check passive expiration
 	if obj.IsExpired(now) {
-		delete(sh.data, key) // Passive deletion
+		sh.remove(key) // Passive deletion
 		return -2
 	}
 
@@ -173,7 +217,7 @@ func (s *Store) TTL(key string) int64 {
 
 	remaining := obj.ExpiresAt.Sub(now).Seconds()
 	if remaining < 0 {
-		delete(sh.data, key)
+		sh.remove(key)
 		return -2
 	}
 
@@ -196,11 +240,11 @@ func (s *Store) Del(key string) bool {
 	now := time.Now()
 	// Check passive expiration
 	if obj.IsExpired(now) {
-		delete(sh.data, key) // Passive deletion
+		sh.remove(key) // Passive deletion
 		return false
 	}
 
-	delete(sh.data, key)
+	sh.remove(key)
 	return true
 }
 
@@ -231,32 +275,44 @@ func (s *Store) ExpireAt(key string, expiresAt time.Time) bool {
 	now := time.Now()
 	// Check if the key is already passively expired
 	if obj.IsExpired(now) {
-		delete(sh.data, key)
+		sh.remove(key)
 		return false
 	}
 
 	if !now.Before(expiresAt) {
-		delete(sh.data, key)
+		sh.remove(key)
 		return true
 	}
 
 	obj.ExpiresAt = expiresAt
 	sh.data[key] = obj
+	sh.trackTTL(key)
 	return true
 }
 
-// ActiveExpireCycle does a bounded cleanup pass for expired volatile keys.
-// It visits Go map entries in iteration order, taking one shard lock at a
-// time. Go map iteration order is unspecified; this is a bounded scan sample,
-// not a uniform random sample. The time limit is cooperative rather than a
-// hard upper bound on elapsed time. Cleanup counts are logged at most once per
-// minute per Store, with counts aggregated between reports.
+// ActiveExpireCycle runs a bounded Redis-style expiry pass and deletes the
+// expired keys it finds. See ActiveExpireCycleWith.
 func (s *Store) ActiveExpireCycle() int {
+	return s.ActiveExpireCycleWith(nil)
+}
+
+// ActiveExpireCycleWith samples volatile keys from the per-shard TTL index,
+// starting at a random shard and random offset so no key is systematically
+// favored, and removes the expired ones. It repeats while more than 25% of a
+// sample was expired, for at most 16 iterations or about 25ms (checked between
+// iterations).
+//
+// If remove is nil, expired keys are deleted directly. Otherwise remove is
+// handed each batch of expired candidates and must delete them (typically
+// after journaling) and return how many it deleted. Candidates may be
+// re-checked by DeleteExpired, which only deletes keys that are still expired.
+// A remove error ends the cycle.
+func (s *Store) ActiveExpireCycleWith(remove func(keys []string) (int, error)) int {
 	const (
-		sampleSize     = 20                    // Maximum volatile keys visited per iteration
-		thresholdRatio = 0.25                  // 25% counter-limit threshold ratio (5 / 20)
-		maxIterations  = 16                    // Maximum loop iterations per tick
-		maxDuration    = 25 * time.Millisecond // Hard CPU latency cap per cycle
+		sampleSize     = 20
+		thresholdRatio = 0.25
+		maxIterations  = 16
+		maxDuration    = 25 * time.Millisecond
 	)
 
 	startTime := time.Now()
@@ -267,57 +323,108 @@ func (s *Store) ActiveExpireCycle() int {
 			break
 		}
 
-		expiredInSample := 0
-		sampledCount := 0
-		now := time.Now()
-
-		for shIdx := 0; shIdx < numShards; shIdx++ {
-			if time.Since(startTime) >= maxDuration {
-				break
-			}
-			sh := &s.shards[shIdx]
-
-			sh.mu.Lock()
-			for key, obj := range sh.data {
-				if time.Since(startTime) >= maxDuration {
-					break
-				}
-
-				if obj.ExpiresAt.IsZero() {
-					continue
-				}
-
-				sampledCount++
-
-				if obj.IsExpired(now) {
-					delete(sh.data, key)
-					expiredInSample++
-					totalDeleted++
-				}
-
-				if sampledCount >= sampleSize {
-					break
-				}
-			}
-			sh.mu.Unlock()
-
-			if sampledCount >= sampleSize {
-				break
-			}
-		}
-
-		if sampledCount == 0 {
+		sampled, expired := s.sampleExpired(sampleSize)
+		if sampled == 0 {
 			break
 		}
 
-		ratio := float64(expiredInSample) / float64(sampledCount)
-		if ratio <= thresholdRatio {
+		if len(expired) > 0 {
+			if remove == nil {
+				totalDeleted += s.DeleteExpired(expired)
+			} else {
+				deleted, err := remove(expired)
+				totalDeleted += deleted
+				if err != nil {
+					log.Printf("[Active Expire] stopping cycle: %v", err)
+					break
+				}
+			}
+		}
+
+		if float64(len(expired))/float64(sampled) <= thresholdRatio {
 			break
 		}
 	}
 
 	s.reportActiveExpiration(totalDeleted)
 	return totalDeleted
+}
+
+// sampleExpired visits up to limit tracked volatile keys and returns how many
+// were sampled and which of them are expired. It does not delete expired keys.
+// Stale index entries are dropped and not counted as samples.
+func (s *Store) sampleExpired(limit int) (int, []string) {
+	const perShard = 5
+
+	now := time.Now()
+	start := rand.IntN(numShards)
+	sampled := 0
+	var expired []string
+
+	for i := 0; i < numShards && sampled < limit; i++ {
+		sh := &s.shards[(start+i)%numShards]
+		sh.mu.Lock()
+		n := len(sh.ttlKeys)
+		if n == 0 {
+			sh.mu.Unlock()
+			continue
+		}
+		offset := rand.IntN(n)
+		take := min(n, perShard, limit-sampled)
+		var stale []string
+		for j := 0; j < take; j++ {
+			key := sh.ttlKeys[(offset+j)%n]
+			obj, exists := sh.data[key]
+			if !exists || obj.ExpiresAt.IsZero() {
+				stale = append(stale, key)
+				continue
+			}
+			sampled++
+			if obj.IsExpired(now) {
+				expired = append(expired, key)
+			}
+		}
+		for _, key := range stale {
+			sh.untrackTTL(key)
+		}
+		sh.mu.Unlock()
+	}
+	return sampled, expired
+}
+
+// FilterExpired returns the keys from candidates that currently exist and are
+// expired.
+func (s *Store) FilterExpired(candidates []string) []string {
+	now := time.Now()
+	var out []string
+	for _, key := range candidates {
+		sh := s.getShard(key)
+		sh.mu.RLock()
+		obj, exists := sh.data[key]
+		sh.mu.RUnlock()
+		if exists && obj.IsExpired(now) {
+			out = append(out, key)
+		}
+	}
+	return out
+}
+
+// DeleteExpired deletes each candidate that is still expired and returns the
+// number deleted. A candidate that was overwritten with a live value since it
+// was sampled is left untouched.
+func (s *Store) DeleteExpired(candidates []string) int {
+	now := time.Now()
+	deleted := 0
+	for _, key := range candidates {
+		sh := s.getShard(key)
+		sh.mu.Lock()
+		if obj, exists := sh.data[key]; exists && obj.IsExpired(now) {
+			sh.remove(key)
+			deleted++
+		}
+		sh.mu.Unlock()
+	}
+	return deleted
 }
 
 func (s *Store) reportActiveExpiration(deleted int) {

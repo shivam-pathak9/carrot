@@ -971,3 +971,94 @@ func TestExecuteSetOverwrite(t *testing.T) {
 		t.Errorf("Expected 'value2', got '%s'", result.String)
 	}
 }
+
+type recordingJournal struct {
+	mu       sync.Mutex
+	commands []Command
+	err      error
+}
+
+func (j *recordingJournal) Append(cmd Command) (Command, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.err != nil {
+		return Command{}, j.err
+	}
+	j.commands = append(j.commands, cmd)
+	return cmd, nil
+}
+
+func (j *recordingJournal) names() []string {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	var out []string
+	for _, c := range j.commands {
+		out = append(out, c.Name+" "+c.Args[0])
+	}
+	return out
+}
+
+func TestActiveExpireJournalsDeletes(t *testing.T) {
+	store := storage.NewStore()
+	executor := NewExecutor(store)
+	journal := &recordingJournal{}
+	executor.SetJournal(journal)
+
+	store.SetAt("soon", "v", time.Now().Add(20*time.Millisecond))
+	store.Set("later", "v", time.Hour)
+	time.Sleep(40 * time.Millisecond)
+
+	if got := executor.ActiveExpire(); got != 1 {
+		t.Fatalf("ActiveExpire deleted %d keys, want 1", got)
+	}
+	names := journal.names()
+	if len(names) != 1 || names[0] != "DEL soon" {
+		t.Fatalf("journaled commands = %v, want [DEL soon]", names)
+	}
+	if _, ok := store.Get("later"); !ok {
+		t.Fatal("unexpired key was removed")
+	}
+}
+
+func TestActiveExpireDoesNotDeleteRewrittenKey(t *testing.T) {
+	store := storage.NewStore()
+	executor := NewExecutor(store)
+	journal := &recordingJournal{}
+	executor.SetJournal(journal)
+
+	store.SetAt("k", "old", time.Now().Add(20*time.Millisecond))
+	time.Sleep(40 * time.Millisecond)
+	// Candidate was sampled as expired, then overwritten before removal.
+	store.Set("k", "new", 0)
+
+	deleted, err := executorJournalAndDelete(executor, []string{"k"})
+	if err != nil || deleted != 0 {
+		t.Fatalf("deleted=%d err=%v, want 0 and nil", deleted, err)
+	}
+	if v, ok := store.Get("k"); !ok || v != "new" {
+		t.Fatalf("Get = %q, %v; want new value preserved", v, ok)
+	}
+	if names := journal.names(); len(names) != 0 {
+		t.Fatalf("no DEL should be journaled, got %v", names)
+	}
+}
+
+func executorJournalAndDelete(e *Executor, keys []string) (int, error) {
+	return e.journalAndDeleteExpired(keys)
+}
+
+func TestActiveExpireKeepsKeysWhenJournalFails(t *testing.T) {
+	store := storage.NewStore()
+	executor := NewExecutor(store)
+	executor.SetJournal(&recordingJournal{err: errors.New("disk full")})
+
+	store.SetAt("k", "v", time.Now().Add(20*time.Millisecond))
+	time.Sleep(40 * time.Millisecond)
+
+	if got := executor.ActiveExpire(); got != 0 {
+		t.Fatalf("ActiveExpire deleted %d keys despite journal failure", got)
+	}
+	if len(store.FilterExpired([]string{"k"})) != 1 {
+		t.Fatal("expired key must remain until its DEL is persisted")
+	}
+}

@@ -105,7 +105,7 @@ List commands currently supported:
 
 Blocking list commands (such as `BLPOP` and `BRPOP`) are not implemented.
 
-The storage layer also supports passive expiration on access and a bounded active expiration sweep for background cleanup.
+The storage layer also supports passive expiration on access and a bounded active expiration sweep that samples a per-shard index of TTL keys and journals `DEL` for expired keys when AOF is enabled.
 
 ---
 
