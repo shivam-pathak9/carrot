@@ -221,3 +221,36 @@ func TestConfigAllInterfaces(t *testing.T) {
 		t.Errorf("Expected '6379', got '%s'", cfg.Port)
 	}
 }
+
+func TestParseBytes(t *testing.T) {
+	for text, want := range map[string]int64{
+		"0": 0, "1024": 1024, "64kb": 64 << 10, "100MB": 100 << 20, "2gb": 2 << 30, " 5 b ": 5,
+	} {
+		got, err := ParseBytes(text)
+		if err != nil || got != want {
+			t.Errorf("ParseBytes(%q) = %d, %v; want %d", text, got, err, want)
+		}
+	}
+	for _, text := range []string{"", "mb", "-1", "1.5mb", "abc", "9999999999gb"} {
+		if _, err := ParseBytes(text); err == nil {
+			t.Errorf("ParseBytes(%q) should fail", text)
+		}
+	}
+}
+
+func TestValidateMaxMemory(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxMemoryBytes = -1
+	if cfg.Validate() == nil {
+		t.Error("negative maxmemory should be rejected")
+	}
+	cfg = DefaultConfig()
+	cfg.MaxMemoryPolicy = "volatile-ttl"
+	if cfg.Validate() == nil {
+		t.Error("unsupported policy should be rejected")
+	}
+	cfg.MaxMemoryPolicy = PolicyAllKeysLRU
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("allkeys-lru should be valid: %v", err)
+	}
+}

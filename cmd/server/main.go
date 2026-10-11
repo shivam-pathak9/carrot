@@ -29,6 +29,12 @@ func main() {
 	flag.BoolVar(&cfg.AOFEnabled, "aof-enabled", cfg.AOFEnabled, "enable append-only persistence")
 	flag.StringVar(&cfg.AOFPath, "aof-file", cfg.AOFPath, "append-only persistence file")
 	flag.StringVar(&cfg.AOFSyncPolicy, "aof-sync", cfg.AOFSyncPolicy, "AOF sync policy: always, everysec, or no")
+	flag.Func("maxmemory", "limit on estimated key/value memory, e.g. 100mb (0 = unlimited)", func(value string) error {
+		bytes, err := config.ParseBytes(value)
+		cfg.MaxMemoryBytes = bytes
+		return err
+	})
+	flag.StringVar(&cfg.MaxMemoryPolicy, "maxmemory-policy", cfg.MaxMemoryPolicy, "when maxmemory is reached: noeviction or allkeys-lru")
 	flag.StringVar(&cpuProfile, "cpu-profile", "", "write a Go CPU profile to this file")
 	flag.Parse()
 

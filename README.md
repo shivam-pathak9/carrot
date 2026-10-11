@@ -155,6 +155,26 @@ write-by-write syncing:
 go run ./cmd/server -aof-file ./data/carrot.aof -aof-sync always
 ```
 
+### Memory limit and eviction
+
+By default memory is unbounded. Set `-maxmemory` (bytes, or `64kb`/`100mb`/`2gb`)
+to cap the estimated memory of keys and values:
+
+```bash
+go run ./cmd/server -maxmemory 100mb -maxmemory-policy allkeys-lru
+```
+
+| Policy | When the limit is reached |
+| --- | --- |
+| `noeviction` (default) | Commands that add data (`SET`, `LPUSH`, `RPUSH`, `LINSERT`, `LSET`, `LMOVE`, ...) return `-OOM command not allowed when used memory > 'maxmemory'`. Reads, `DEL`, pops, and `EXPIRE` still work. |
+| `allkeys-lru` | Before each such command, keys are evicted until usage is under the limit. Each eviction picks the least recently used of 5 random keys (approximate LRU, like Redis) and is journaled as `DEL` before removal. |
+
+Limitations: usage is an estimate (key and value bytes plus a fixed per-key
+overhead), not Go heap size, and excludes connection buffers and the AOF. The
+limit is checked before each command, so one command can overshoot it, and a
+write batch can overshoot by up to 64 commands. Only these two policies exist;
+there are no `volatile-*` policies.
+
 On a running server, compact the AOF from the current live data with:
 
 ```bash
@@ -240,7 +260,7 @@ Important gaps before production use still include:
 - OS/power-loss and disk-failure injection beyond the server-process SIGKILL
   recovery harness, plus backup procedures
 - Authentication, transport security, and a safer default bind policy
-- Total database memory quotas, metrics, health checks, and deployment guidance
+- Metrics, health checks, and deployment guidance (memory limits exist but are estimates)
 - Hashes, sets, sorted sets, and blocking list commands
 
 ## Local benchmarks
@@ -372,6 +392,34 @@ iteration executes `SET` then `GET` through `Executor` on a worker-selected
 key. With no journal, executor mutations rely on shard locks and bypass the
 journaled write sequencer. This is an in-process microbenchmark, not a network
 benchmark or an AOF-enabled contention measurement.
+
+### Memory limit overhead and behavior
+
+Measured with `redis-benchmark -t set,get -n 200000 -c 10 -P 16 -d 100
+-r 1000000`, AOF disabled, `cmd/server`, WSL2. Medians of 7 interleaved runs
+(the servers ran side by side). "Last commit" is the build before the
+active-expiry and `maxmemory` changes.
+
+| Config | SET median rps | GET median rps | p99 SET / GET |
+| --- | ---: | ---: | --- |
+| Last commit | 156,250 | 167,785 | 1.70 / 1.61 ms |
+| New, no limit | 147,167 | 163,934 | 2.30 / 1.94 ms |
+| New, `-maxmemory 5mb -maxmemory-policy allkeys-lru` (every `SET` evicts) | 142,755 | 168,776 | 1.89 / 1.71 ms |
+
+`SET` is about 6% lower than the last commit; `GET` is within noise. Run-to-run
+variation on WSL2 was as large as these gaps (one config's `SET` ranged from
+126k to 163k rps), so read this as "no large regression", not a precise cost.
+AOF-enabled writes, the reactor server, and eviction under `always` sync were
+not measured.
+
+Behavior check against a running server with a 1 MB limit and 100-byte values
+(a small script over RESP, because `redis-benchmark` aborts on the first
+error reply):
+
+| Policy | Result |
+| --- | --- |
+| `noeviction` | 3,507 of 20,000 writes accepted (about 298 estimated bytes per key); the rest returned `-OOM`. All accepted keys stayed readable, `GET` kept working at the limit, a rejected `SET` was not stored, and `DEL` freed space for the next `SET`. |
+| `allkeys-lru` | 60,000 writes, 0 errors, about 3,400 keys resident (bounded). The newest 100 keys were all present. With 50 hot keys read every 100 writes or more often, all 50 survived; read every 500 writes, 40 to 42 of 50 survived, which is expected from sampling 5 keys per eviction. |
 
 Reproduce the network comparison and Redis reference baseline with
 `make benchmark`; by default it runs pipeline depths 1 and 16, three times

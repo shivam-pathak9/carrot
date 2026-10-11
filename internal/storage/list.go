@@ -18,6 +18,7 @@ type listValue struct {
 	buffer []string
 	head   int
 	size   int
+	bytes  int // total length of the stored strings, maintained by every mutator
 }
 
 func (l *listValue) Len() int {
@@ -50,6 +51,7 @@ func (l *listValue) set(index int, value string) {
 
 func (l *listValue) push(value string, left bool) {
 	l.grow()
+	l.bytes += len(value)
 	if left {
 		l.head = (l.head - 1 + len(l.buffer)) % len(l.buffer)
 	} else {
@@ -67,6 +69,7 @@ func (l *listValue) pop(left bool) (string, bool) {
 	}
 	if left {
 		value := l.at(0)
+		l.bytes -= len(value)
 		l.buffer[l.head] = ""
 		l.head = (l.head + 1) % len(l.buffer)
 		l.size--
@@ -74,6 +77,7 @@ func (l *listValue) pop(left bool) (string, bool) {
 	}
 	last := l.size - 1
 	value := l.at(last)
+	l.bytes -= len(value)
 	l.set(last, "")
 	l.size--
 	return value, true
@@ -81,6 +85,7 @@ func (l *listValue) pop(left bool) (string, bool) {
 
 func (l *listValue) insert(index int, value string) {
 	l.grow()
+	l.bytes += len(value)
 	if index < l.size-index {
 		l.head = (l.head - 1 + len(l.buffer)) % len(l.buffer)
 		for i := 0; i < index; i++ {
@@ -96,6 +101,7 @@ func (l *listValue) insert(index int, value string) {
 }
 
 func (l *listValue) removeAt(index int) {
+	l.bytes -= len(l.at(index))
 	if index < l.size-index-1 {
 		for i := index; i > 0; i-- {
 			l.set(i, l.at(i-1))
@@ -124,6 +130,16 @@ func (l *listValue) replace(items []string) {
 	copy(l.buffer, items)
 	l.head = 0
 	l.size = len(items)
+	l.bytes = 0
+	for _, item := range items {
+		l.bytes += len(item)
+	}
+}
+
+// assign overwrites the element at index and keeps the byte count current.
+func (l *listValue) assign(index int, value string) {
+	l.bytes += len(value) - len(l.at(index))
+	l.set(index, value)
 }
 
 func (l *listValue) index(index int64) (int, bool) {
@@ -139,11 +155,15 @@ func (l *listValue) index(index int64) (int, bool) {
 
 func (s *Store) liveObjectLocked(sh *shard, key string) (Obj, bool) {
 	obj, exists := sh.data[key]
-	if exists && obj.IsExpired(time.Now()) {
+	if !exists {
+		return Obj{}, false
+	}
+	now := time.Now()
+	if obj.IsExpired(now) {
 		sh.remove(key)
 		return Obj{}, false
 	}
-	return obj, exists
+	return sh.touch(key, obj, now), true
 }
 
 // GetString returns a string value and reports WRONGTYPE for non-string keys.
@@ -181,7 +201,7 @@ func (s *Store) ListPush(key string, values []string, left, onlyExisting bool) (
 	for _, value := range values {
 		obj.list.push(value, left)
 	}
-	sh.data[key] = obj
+	sh.put(key, obj)
 	return int64(obj.list.Len()), nil
 }
 
@@ -211,7 +231,7 @@ func (s *Store) ListPop(key string, left bool, count int64) ([]string, error) {
 	if obj.list.Len() == 0 {
 		sh.remove(key)
 	} else {
-		sh.data[key] = obj
+		sh.put(key, obj)
 	}
 	return values, nil
 }
@@ -301,8 +321,8 @@ func (s *Store) ListSet(key string, index int64, value string) error {
 	if !ok {
 		return ErrListIndexRange
 	}
-	obj.list.set(i, value)
-	sh.data[key] = obj
+	obj.list.assign(i, value)
+	sh.put(key, obj)
 	return nil
 }
 
@@ -337,7 +357,7 @@ func (s *Store) ListTrim(key string, start, stop int64) error {
 		return nil
 	}
 	obj.list.replace(obj.list.rangeCopy(int(start), int(stop+1)))
-	sh.data[key] = obj
+	sh.put(key, obj)
 	return nil
 }
 
@@ -383,7 +403,7 @@ func (s *Store) ListRem(key string, count int64, value string) (int64, error) {
 	if obj.list.Len() == 0 {
 		sh.remove(key)
 	} else {
-		sh.data[key] = obj
+		sh.put(key, obj)
 	}
 	return removed, nil
 }
@@ -412,7 +432,7 @@ func (s *Store) ListInsert(key, pivot, value string, before bool) (int64, error)
 			insertAt++
 		}
 		obj.list.insert(insertAt, value)
-		sh.data[key] = obj
+		sh.put(key, obj)
 		return int64(obj.list.Len()), nil
 	}
 	return -1, nil
@@ -504,7 +524,7 @@ func (s *Store) listMoveLocked(srcShard, dstShard *shard, src, dst string, fromL
 	if src == dst {
 		value, _ := source.list.pop(fromLeft)
 		source.list.push(value, toLeft)
-		srcShard.data[src] = source
+		srcShard.put(src, source)
 		return value, true, nil
 	}
 
@@ -522,8 +542,8 @@ func (s *Store) listMoveLocked(srcShard, dstShard *shard, src, dst string, fromL
 	if source.list.Len() == 0 {
 		srcShard.remove(src)
 	} else {
-		srcShard.data[src] = source
+		srcShard.put(src, source)
 	}
-	dstShard.data[dst] = destination
+	dstShard.put(dst, destination)
 	return value, true, nil
 }

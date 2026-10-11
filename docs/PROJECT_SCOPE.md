@@ -37,7 +37,7 @@ tests, wrong-type behavior, expiration interactions, and documentation.
 
 ## Current behavior and verified baseline
 
-As of 2026-10-03, Carrot has:
+As of 2026-10-11, Carrot has:
 
 - A single-process store with RESP AOF persistence, enabled by default.
   Durability varies by sync policy; manual background compaction is available
@@ -45,6 +45,9 @@ As of 2026-10-03, Carrot has:
 - String commands: `PING`, `GET`, `SET` with `EX`/`PX`/`PXAT`, `DEL`, `TTL`,
   `EXPIRE`, and `PEXPIREAT`.
 - Non-blocking list commands documented in the [README](../README.md).
+- Bounded active expiry that samples a per-shard TTL index and journals `DEL`
+  for expired keys, plus an optional `-maxmemory` limit with `noeviction` or
+  approximate `allkeys-lru` eviction (see the [README](../README.md#memory-limit-and-eviction)).
 - Two network implementations: a goroutine-per-connection server and a
   Linux-only epoll reactor.
 - A RESP decoder with line, bulk-string, and array size limits.
@@ -60,7 +63,7 @@ As of 2026-10-03, Carrot has:
 - Host and port flags on both server binaries; the default host is
   `0.0.0.0`.
 
-The repository currently has 161 top-level unit and integration test
+The repository currently has 180 top-level unit and integration test
 functions, including server and reactor TCP behavior. That count is not a
 measure of coverage. The current package coverage is recorded in
 [TEST_SUMMARY.md](./TEST_SUMMARY.md).
@@ -79,7 +82,8 @@ memory proportional to live data. `always` uses bounded group commit; mutation
 application remains ordered. The default bind remains
 `0.0.0.0` by choice, with an explicit startup warning; local deployments
 should bind to loopback.
-There is no total database-memory quota or metrics. Passing tests does not
+`-maxmemory` bounds an estimate of key/value memory (`noeviction` or
+`allkeys-lru`); there are no metrics. Passing tests does not
 close these operational gaps.
 
 ## Readiness milestones

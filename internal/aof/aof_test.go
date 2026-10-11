@@ -874,3 +874,43 @@ func TestAOFActiveExpireJournalsDelAndReplays(t *testing.T) {
 		t.Fatalf("kept = %q, %v", v, ok)
 	}
 }
+
+func TestAOFReplayReproducesEvictions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "appendonly.aof")
+	store := storage.NewStore()
+	logFile, err := Open(path, "always", store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := command.NewExecutor(store)
+	executor.SetJournal(logFile)
+	for i := 0; i < 6; i++ {
+		execute(t, executor, "SET", "key-"+strconv.Itoa(i), strings.Repeat("x", 100))
+	}
+	executor.SetMemoryLimit(store.UsedMemory()-1, "allkeys-lru")
+	for i := 6; i < 12; i++ {
+		execute(t, executor, "SET", "key-"+strconv.Itoa(i), strings.Repeat("x", 100))
+	}
+	if err := logFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered := storage.NewStore()
+	recoveredLog, err := Open(path, "always", recovered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recoveredLog.Close()
+
+	if got, want := recovered.UsedMemory(), store.UsedMemory(); got != want {
+		t.Fatalf("recovered usage = %d, want %d", got, want)
+	}
+	for i := 0; i < 12; i++ {
+		key := "key-" + strconv.Itoa(i)
+		_, inOriginal := store.Get(key)
+		_, inRecovered := recovered.Get(key)
+		if inOriginal != inRecovered {
+			t.Fatalf("%s: present before restart=%v, after=%v", key, inOriginal, inRecovered)
+		}
+	}
+}

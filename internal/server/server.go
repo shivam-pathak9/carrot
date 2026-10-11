@@ -53,7 +53,7 @@ func NewServer(cfg config.Config) *Server {
 		config:    cfg,
 		store:     store,
 		parser:    command.NewParser(),
-		executor:  command.NewExecutor(store),
+		executor:  newExecutor(store, cfg),
 		active:    make(map[net.Conn]struct{}),
 		stopChan:  make(chan struct{}),
 		serveDone: make(chan struct{}),
@@ -368,4 +368,10 @@ func (w *limitedWriter) Write(p []byte) (int, error) {
 	n, err := w.writer.Write(p)
 	w.written += n
 	return n, err
+}
+
+func newExecutor(store *storage.Store, cfg config.Config) *command.Executor {
+	executor := command.NewExecutor(store)
+	executor.SetMemoryLimit(cfg.MaxMemoryBytes, cfg.MaxMemoryPolicy)
+	return executor
 }

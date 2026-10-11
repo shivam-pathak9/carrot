@@ -54,7 +54,7 @@ func NewServer(cfg config.Config) *Server {
 		listenerFD: -1,
 		store:      store,
 		parser:     command.NewParser(),
-		executor:   command.NewExecutor(store),
+		executor:   newExecutor(store, cfg),
 		stopChan:   make(chan struct{}),
 	}
 }
@@ -249,4 +249,10 @@ func zoneToString(zoneID uint32) string {
 		return ifi.Name
 	}
 	return ""
+}
+
+func newExecutor(store *storage.Store, cfg config.Config) *command.Executor {
+	executor := command.NewExecutor(store)
+	executor.SetMemoryLimit(cfg.MaxMemoryBytes, cfg.MaxMemoryPolicy)
+	return executor
 }

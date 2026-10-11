@@ -3,10 +3,17 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"net"
 	"strconv"
 	"strings"
 	"time"
+)
+
+// Eviction policies accepted for MaxMemoryPolicy.
+const (
+	PolicyNoEviction = "noeviction"
+	PolicyAllKeysLRU = "allkeys-lru"
 )
 
 // Config contains listener, resource-limit, and client-timeout settings.
@@ -21,6 +28,10 @@ type Config struct {
 	AOFEnabled       bool
 	AOFPath          string
 	AOFSyncPolicy    string
+	// MaxMemoryBytes limits estimated key and value memory; zero means no limit.
+	MaxMemoryBytes int64
+	// MaxMemoryPolicy selects what happens to writes once the limit is reached.
+	MaxMemoryPolicy string
 }
 
 // DefaultConfig returns the server's baseline settings, including its bind address.
@@ -36,6 +47,7 @@ func DefaultConfig() Config {
 		AOFEnabled:       true,
 		AOFPath:          "appendonly.aof",
 		AOFSyncPolicy:    "everysec",
+		MaxMemoryPolicy:  PolicyNoEviction,
 	}
 }
 
@@ -63,6 +75,9 @@ func (c Config) WithDefaults() Config {
 	}
 	if c.AOFSyncPolicy == "" {
 		c.AOFSyncPolicy = defaults.AOFSyncPolicy
+	}
+	if c.MaxMemoryPolicy == "" {
+		c.MaxMemoryPolicy = defaults.MaxMemoryPolicy
 	}
 	return c
 }
@@ -93,6 +108,14 @@ func (c Config) Validate() error {
 	}
 	if c.WriteTimeout <= 0 {
 		return fmt.Errorf("write timeout must be greater than zero")
+	}
+	if c.MaxMemoryBytes < 0 {
+		return fmt.Errorf("max memory must not be negative")
+	}
+	switch c.MaxMemoryPolicy {
+	case PolicyNoEviction, PolicyAllKeysLRU:
+	default:
+		return fmt.Errorf("max memory policy must be one of: %s, %s", PolicyNoEviction, PolicyAllKeysLRU)
 	}
 	if c.AOFEnabled {
 		if strings.TrimSpace(c.AOFPath) == "" {
@@ -128,4 +151,29 @@ func validHostname(host string) bool {
 		}
 	}
 	return true
+}
+
+// ParseBytes parses a size such as "1048576", "64kb", "100mb", or "2gb".
+// Units are binary (1kb = 1024 bytes) and case-insensitive.
+func ParseBytes(text string) (int64, error) {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	multiplier := int64(1)
+	for _, unit := range []struct {
+		suffix     string
+		multiplier int64
+	}{{"gb", 1 << 30}, {"mb", 1 << 20}, {"kb", 1 << 10}, {"b", 1}} {
+		if strings.HasSuffix(lower, unit.suffix) {
+			lower = strings.TrimSuffix(lower, unit.suffix)
+			multiplier = unit.multiplier
+			break
+		}
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(lower), 10, 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("invalid size %q", text)
+	}
+	if n > math.MaxInt64/multiplier {
+		return 0, fmt.Errorf("size %q is too large", text)
+	}
+	return n * multiplier, nil
 }

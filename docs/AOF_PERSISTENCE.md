@@ -46,7 +46,10 @@ does not renew a key's lifetime. Keys removed by the active expiry sweep are
 journaled as `DEL` before removal; keys removed lazily on read are not, because
 replay already drops them via their absolute deadline (a wall clock that moves
 backwards between crash and restart could resurrect such a key until the next
-rewrite). Recovery replays records before the server
+rewrite). `allkeys-lru` evictions are journaled the same way, as `DEL` records written
+before the key is removed. Replay uses an executor with no memory limit and
+reproduces evictions from those records. Writes refused with `-OOM` are never
+journaled. Recovery replays records before the server
 accepts client connections. An incomplete final RESP command is truncated to
 the last complete record; malformed complete data fails startup rather than
 silently skipping history. Recovery streams records from disk instead of

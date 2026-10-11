@@ -1,6 +1,6 @@
 # Verified test baseline
 
-Validated on 2026-10-07 with Go 1.26.4 on Linux/amd64. The repository has 161
+Validated on 2026-10-11 with Go 1.26.4 on Linux/amd64. The repository has 180
 top-level test functions in `*_test.go` files; nested subtests are not counted
 separately.
 
@@ -10,13 +10,13 @@ separately.
 |---|---:|---|
 | `internal/aof` | 75.3% | Pass |
 | `internal/client` | 57.7% | Pass |
-| `internal/command` | 73.7% | Pass |
-| `internal/config` | 92.2% | Pass |
+| `internal/command` | 75.6% | Pass |
+| `internal/config` | 94.3% | Pass |
 | `internal/cpuprofile` | 81.8% | Pass |
 | `internal/protocol/resp` | 78.7% | Pass |
-| `internal/reactor` | 69.7% | Pass |
-| `internal/server` | 73.0% | Pass |
-| `internal/storage` | 84.0% | Pass |
+| `internal/reactor` | 70.0% | Pass |
+| `internal/server` | 73.8% | Pass |
+| `internal/storage` | 86.0% | Pass |
 
 Packages without tests (`cmd/*`) are not represented in these percentages.
 Coverage is package-local, not a weighted project-wide percentage.
@@ -60,6 +60,12 @@ fuzzing is an explicit command in [TEST_EXECUTION_GUIDE.md](./TEST_EXECUTION_GUI
   failure or shutdown race.
 - Redis CLI verification is a manual smoke test; automated tests use Go TCP
   clients.
+- Expiry and memory tests cover the TTL index, sampled active expiry,
+  `DEL` journaling for expired and evicted keys, journal-failure behavior,
+  memory-estimate consistency across string and list operations, LRU victim
+  selection, `-OOM` rejection, and replay of evictions. Eviction quality
+  (how close sampled LRU is to true LRU) is only checked by the manual
+  benchmark in the [README](../README.md#memory-limit-overhead-and-behavior).
 - AOF tests cover RESP replay, expiration preservation, incomplete-tail
   truncation, file locking, bounded group commit, compaction, rewrite failure
   cleanup, and restart through both server modes. A network-level subprocess

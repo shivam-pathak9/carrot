@@ -12,10 +12,10 @@ func (s *Store) setRawObj(key string, obj Obj) {
 	sh := s.getShard(key)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
-	sh.data[key] = obj
+	sh.put(key, obj)
 	if obj.ExpiresAt.IsZero() {
-		sh.untrackTTL(key)
+		sh.volatile.remove(key)
 	} else {
-		sh.trackTTL(key)
+		sh.volatile.add(key)
 	}
 }

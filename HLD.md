@@ -21,7 +21,7 @@ Carrot is a learning and portfolio project for exploring:
 
 It is not a Redis replacement and is not safe for production data. It has no
 authentication, TLS, replication, backup automation, cluster coordination,
-or total database-memory quota. AOF is Linux-only. These are actual
+or exact database-memory accounting. AOF is Linux-only. These are actual
 limitations, not features that should be inferred from the architecture
 diagrams.
 
@@ -338,6 +338,22 @@ calls it in the event-loop after each event batch; its wait timeout also lets
 the loop return during idle periods. The sweep checks a 25 ms elapsed-time
 budget and fixed iteration/sample limits, but it is a cooperative budget,
 not a hard real-time latency guarantee.
+
+### Memory limit and eviction
+
+Every shard write goes through `shard.put`/`shard.remove`, which keep a
+store-wide estimate of bytes (key + value + list items + a fixed per-key
+overhead) and an exact per-shard key index. Each object records its last
+access time; reads and writes update it.
+
+`Executor.admit` runs before commands that add data, under the mutation lock
+when a journal is installed. If usage exceeds `maxmemory`, `noeviction`
+replies `-OOM`; `allkeys-lru` repeatedly samples 5 random keys, journals a
+`DEL` for the oldest, then deletes it, until usage fits. A failed journal
+write keeps the key and surfaces the error. Refused commands are never
+journaled. Replay uses an executor without a limit and reproduces evictions
+from the `DEL` records. The check precedes the command, so a command (or a
+group-commit batch of up to 64) can overshoot the limit.
 
 ## 8. Persistence model
 

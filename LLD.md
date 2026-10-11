@@ -10,7 +10,7 @@ is authoritative when prose and code differ.
 |---|---|
 | `internal/protocol/resp` | Bounded RESP decoding and encoding |
 | `internal/command` | Parse commands, dispatch handlers, and sequence journaled mutations |
-| `internal/storage` | Typed string/list values, expiration, sharded access, and rewrite snapshots |
+| `internal/storage` | Typed string/list values, expiration, memory estimate, LRU sampling, sharded access, and rewrite snapshots |
 | `internal/aof` | AOF locking, canonical append/replay, group commit, sync policies, and rewrite |
 | `internal/server` | Standard `net.Conn` listener with a goroutine per client |
 | `internal/reactor` | Linux epoll loop, non-blocking client I/O, and synchronous command dispatch |
@@ -81,6 +81,16 @@ and directory syncing.
 shards, but no benchmark establishes that 256 shards is optimal. AOF-enabled
 mutation ordering is centralized above the store, so sharding does not make
 those mutations concurrent.
+
+All shard writes go through `shard.put` and `shard.remove` in
+`internal/storage`. They maintain the store-wide memory estimate, a per-shard
+index of all keys (for LRU sampling), and an index of keys that may expire (for
+active expiry). Writing to `shard.data` directly would desynchronize these.
+
+`command.Executor.admit` (`internal/command/memory.go`) enforces `-maxmemory`
+before commands that add data, under the mutation lock when a journal is
+installed. `Executor.ActiveExpire` re-checks sampled expired keys and journals
+a `DEL` for each before deleting. See the HLD for the eviction flow.
 
 The standard server handles each connection in a goroutine. The reactor uses
 non-blocking sockets and epoll, with one event-loop path for reads, parsing,

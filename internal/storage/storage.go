@@ -5,6 +5,7 @@ import (
 	"log"
 	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -16,6 +17,8 @@ type Obj struct {
 	ExpiresAt time.Time
 	Kind      ValueKind
 	list      listValue
+
+	lastAccess int64 // Unix nanoseconds of the last read or write, for LRU eviction
 }
 
 // SnapshotEntry is a stable copy of one live key returned during an AOF
@@ -48,46 +51,53 @@ const (
 const numShards = 256
 
 // shard represents an isolated partition of the storage engine containing its own RWMutex and map.
+// Every write goes through put and remove so the key indexes and the
+// store-wide memory estimate stay consistent with data.
 type shard struct {
 	mu   sync.RWMutex
 	data map[string]Obj
 
-	// ttlKeys lists keys that may carry an expiration so active expiry can
-	// sample volatile keys in O(1) without scanning persistent ones. ttlPos maps
-	// each tracked key to its slice index. Entries can be stale (the key was
-	// overwritten as persistent); sampling discards them.
-	ttlKeys []string
-	ttlPos  map[string]int
+	// all holds exactly the keys in data and supports O(1) random sampling for
+	// eviction.
+	all keyIndex
+	// volatile holds keys that may carry an expiration for active expiry. It
+	// can contain stale entries (a key overwritten as persistent); sampling
+	// discards them.
+	volatile keyIndex
+
+	used *atomic.Int64 // store-wide estimated bytes, shared by all shards
 }
 
-func (sh *shard) trackTTL(key string) {
-	if sh.ttlPos == nil {
-		sh.ttlPos = make(map[string]int)
+// put stores obj under key, stamps it as just accessed, and updates the memory
+// estimate. The caller holds sh.mu.
+func (sh *shard) put(key string, obj Obj) {
+	obj.lastAccess = time.Now().UnixNano()
+	delta := obj.memorySize(key)
+	if old, exists := sh.data[key]; exists {
+		delta -= old.memorySize(key)
+	} else {
+		sh.all.add(key)
 	}
-	if _, ok := sh.ttlPos[key]; ok {
-		return
-	}
-	sh.ttlPos[key] = len(sh.ttlKeys)
-	sh.ttlKeys = append(sh.ttlKeys, key)
+	sh.data[key] = obj
+	sh.used.Add(delta)
 }
 
-func (sh *shard) untrackTTL(key string) {
-	pos, ok := sh.ttlPos[key]
-	if !ok {
-		return
-	}
-	last := len(sh.ttlKeys) - 1
-	moved := sh.ttlKeys[last]
-	sh.ttlKeys[pos] = moved
-	sh.ttlPos[moved] = pos
-	sh.ttlKeys = sh.ttlKeys[:last]
-	delete(sh.ttlPos, key)
+// touch records a read of obj for LRU eviction without changing its size.
+// The caller holds sh.mu for writing.
+func (sh *shard) touch(key string, obj Obj, now time.Time) Obj {
+	obj.lastAccess = now.UnixNano()
+	sh.data[key] = obj
+	return obj
 }
 
-// remove deletes key and its TTL index entry. The caller holds sh.mu.
+// remove deletes key from the map and both indexes. The caller holds sh.mu.
 func (sh *shard) remove(key string) {
-	delete(sh.data, key)
-	sh.untrackTTL(key)
+	if old, exists := sh.data[key]; exists {
+		sh.used.Add(-old.memorySize(key))
+		delete(sh.data, key)
+		sh.all.remove(key)
+	}
+	sh.volatile.remove(key)
 }
 
 // Store is the in-memory typed key-value database used by Carrot. Its shard
@@ -96,6 +106,7 @@ func (sh *shard) remove(key string) {
 // only when a journal is installed to preserve persistence ordering.
 type Store struct {
 	shards            [numShards]shard
+	usedBytes         atomic.Int64
 	expirationLogMu   sync.Mutex
 	lastExpirationLog time.Time
 	pendingExpired    int
@@ -130,6 +141,7 @@ func NewStore() *Store {
 	s := &Store{}
 	for i := 0; i < numShards; i++ {
 		s.shards[i].data = make(map[string]Obj)
+		s.shards[i].used = &s.usedBytes
 	}
 	return s
 }
@@ -148,15 +160,15 @@ func (s *Store) Set(key string, value string, ttl time.Duration) {
 		expiresAt = time.Now().Add(ttl)
 	}
 
-	sh.data[key] = Obj{
+	sh.put(key, Obj{
 		Value:     value,
 		ExpiresAt: expiresAt,
 		Kind:      StringKind,
-	}
+	})
 	if expiresAt.IsZero() {
-		sh.untrackTTL(key)
+		sh.volatile.remove(key)
 	} else {
-		sh.trackTTL(key)
+		sh.volatile.add(key)
 	}
 }
 
@@ -171,12 +183,12 @@ func (s *Store) SetAt(key, value string, expiresAt time.Time) {
 		sh.remove(key)
 		return
 	}
-	sh.data[key] = Obj{
+	sh.put(key, Obj{
 		Value:     value,
 		ExpiresAt: expiresAt,
 		Kind:      StringKind,
-	}
-	sh.trackTTL(key)
+	})
+	sh.volatile.add(key)
 }
 
 // Get returns the stored value for key if it still exists and has not expired.
@@ -285,8 +297,8 @@ func (s *Store) ExpireAt(key string, expiresAt time.Time) bool {
 	}
 
 	obj.ExpiresAt = expiresAt
-	sh.data[key] = obj
-	sh.trackTTL(key)
+	sh.put(key, obj)
+	sh.volatile.add(key)
 	return true
 }
 
@@ -364,7 +376,7 @@ func (s *Store) sampleExpired(limit int) (int, []string) {
 	for i := 0; i < numShards && sampled < limit; i++ {
 		sh := &s.shards[(start+i)%numShards]
 		sh.mu.Lock()
-		n := len(sh.ttlKeys)
+		n := sh.volatile.size()
 		if n == 0 {
 			sh.mu.Unlock()
 			continue
@@ -373,7 +385,7 @@ func (s *Store) sampleExpired(limit int) (int, []string) {
 		take := min(n, perShard, limit-sampled)
 		var stale []string
 		for j := 0; j < take; j++ {
-			key := sh.ttlKeys[(offset+j)%n]
+			key := sh.volatile.at((offset + j) % n)
 			obj, exists := sh.data[key]
 			if !exists || obj.ExpiresAt.IsZero() {
 				stale = append(stale, key)
@@ -385,7 +397,7 @@ func (s *Store) sampleExpired(limit int) (int, []string) {
 			}
 		}
 		for _, key := range stale {
-			sh.untrackTTL(key)
+			sh.volatile.remove(key)
 		}
 		sh.mu.Unlock()
 	}

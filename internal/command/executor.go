@@ -43,6 +43,8 @@ type AsyncJournalRewriter interface {
 // It holds a reference to the shared key-value storage engine.
 type Executor struct {
 	store         *storage.Store
+	maxMemory     int64
+	evictLRU      bool
 	journal       Journal
 	mutationMu    sync.Mutex
 	rewriteMu     sync.RWMutex
@@ -112,11 +114,20 @@ func (e *Executor) Execute(cmd Command) (resp.Value, error) {
 		// persisted order matches in-memory mutation order and rewrite snapshots.
 		e.mutationMu.Lock()
 		defer e.mutationMu.Unlock()
+		if reply, ok, err := e.admitOrReject(cmd); err != nil {
+			return resp.Value{}, err
+		} else if !ok {
+			return reply, nil
+		}
 		persisted, err := e.journal.Append(cmd)
 		if err != nil {
 			return resp.Value{}, fmt.Errorf("persist command before applying it: %w", err)
 		}
 		cmd = persisted
+	} else if reply, ok, err := e.admitOrReject(cmd); err != nil {
+		return resp.Value{}, err
+	} else if !ok {
+		return reply, nil
 	}
 	return e.execute(cmd)
 }
@@ -153,16 +164,7 @@ func (e *Executor) journalAndDeleteExpired(candidates []string) (int, error) {
 		commands[i] = Command{Name: "DEL", Args: []string{key}}
 	}
 
-	var err error
-	if batch, ok := journal.(BatchJournal); ok {
-		_, err = batch.AppendBatch(commands)
-	} else {
-		for _, cmd := range commands {
-			if _, err = journal.Append(cmd); err != nil {
-				break
-			}
-		}
-	}
+	err := appendCommands(journal, commands)
 	if err != nil {
 		return 0, fmt.Errorf("persist expiry deletes: %w", err)
 	}
@@ -391,22 +393,41 @@ func (e *Executor) writeLoop() {
 }
 
 func (e *Executor) commitMutationBatch(journal BatchJournal, batch []*executorRequest) {
-	commands := make([]Command, len(batch))
-	for i, request := range batch {
-		commands[i] = request.cmd
-	}
-	e.mutationMu.Lock()
-	persisted, err := journal.AppendBatch(commands)
-	if err == nil && len(persisted) != len(batch) {
-		err = fmt.Errorf("journal returned %d commands for batch of %d", len(persisted), len(batch))
-	}
 	results := make([]executionResult, len(batch))
-	for i := range batch {
+	e.mutationMu.Lock()
+
+	// Apply the memory limit first so refused commands are never journaled.
+	accepted := make([]int, 0, len(batch))
+	for i, request := range batch {
+		reply, ok, err := e.admitOrReject(request.cmd)
+		switch {
+		case err != nil:
+			results[i].err = err
+		case !ok:
+			results[i].value = reply
+		default:
+			accepted = append(accepted, i)
+		}
+	}
+
+	commands := make([]Command, len(accepted))
+	for j, i := range accepted {
+		commands[j] = batch[i].cmd
+	}
+	var persisted []Command
+	var err error
+	if len(commands) > 0 {
+		persisted, err = journal.AppendBatch(commands)
+	}
+	if err == nil && len(persisted) != len(commands) {
+		err = fmt.Errorf("journal returned %d commands for batch of %d", len(persisted), len(commands))
+	}
+	for j, i := range accepted {
 		if err != nil {
 			results[i].err = fmt.Errorf("persist command before applying it: %w", err)
 			continue
 		}
-		results[i].value, results[i].err = e.execute(persisted[i])
+		results[i].value, results[i].err = e.execute(persisted[j])
 	}
 	e.mutationMu.Unlock()
 	for i, request := range batch {

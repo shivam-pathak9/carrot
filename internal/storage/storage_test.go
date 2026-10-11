@@ -662,11 +662,11 @@ func TestTTLIndexStaysConsistent(t *testing.T) {
 	count := 0
 	for i := range store.shards {
 		sh := &store.shards[i]
-		if len(sh.ttlKeys) != len(sh.ttlPos) {
-			t.Fatalf("shard %d: ttlKeys=%d ttlPos=%d", i, len(sh.ttlKeys), len(sh.ttlPos))
+		if len(sh.volatile.keys) != len(sh.volatile.pos) {
+			t.Fatalf("shard %d: keys=%d pos=%d", i, len(sh.volatile.keys), len(sh.volatile.pos))
 		}
-		for pos, key := range sh.ttlKeys {
-			if sh.ttlPos[key] != pos {
+		for pos, key := range sh.volatile.keys {
+			if sh.volatile.pos[key] != pos {
 				t.Fatalf("shard %d: position mismatch for %q", i, key)
 			}
 			count++
